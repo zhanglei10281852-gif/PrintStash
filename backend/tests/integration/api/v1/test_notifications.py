@@ -98,6 +98,13 @@ class TestGetSettings:
 
         assert body["enabled"] is False
 
+    def test_reports_generation_protection_as_on_by_default(
+        self, client: TestClient, auth_headers: dict[str, str]
+    ) -> None:
+        body = client.get("/api/v1/notifications", headers=auth_headers).json()
+
+        assert body["generation_protection"] is True
+
     def test_lists_the_channels_alongside_it(
         self, client: TestClient, auth_headers: dict[str, str], channel_id: int
     ) -> None:
@@ -140,6 +147,20 @@ class TestUpdateSettings:
 
         body = client.get("/api/v1/notifications", headers=auth_headers).json()
         assert body["enabled"] is False
+
+    def test_turns_off_generation_protection(
+        self, client: TestClient, auth_headers: dict[str, str]
+    ) -> None:
+        response = client.put(
+            "/api/v1/notifications",
+            json={"enabled": True, "generation_protection": False},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["generation_protection"] is False
+        body = client.get("/api/v1/notifications", headers=auth_headers).json()
+        assert body["generation_protection"] is False
 
     def test_rejects_an_unknown_field(
         self, client: TestClient, auth_headers: dict[str, str]
@@ -329,6 +350,13 @@ class TestCreateChannel:
 
         assert body["enabled"] is True
 
+    def test_reports_the_first_configuration_generation(
+        self, client: TestClient, auth_headers: dict[str, str]
+    ) -> None:
+        body = _create(client, auth_headers).json()
+
+        assert body["config_generation"] == 1
+
     def test_rejects_a_non_superuser(
         self, client: TestClient, user_headers: UserHeaders
     ) -> None:
@@ -392,6 +420,18 @@ class TestUpdateChannel:
         ).json()
 
         assert body["events"] == ["printer_offline"]
+
+    def test_a_new_url_starts_a_new_configuration_generation(
+        self, client: TestClient, auth_headers: dict[str, str], channel_id: int
+    ) -> None:
+        body = client.patch(
+            f"/api/v1/notifications/channels/{channel_id}",
+            json={"config": {"url": "https://hooks.example.test/elsewhere"}},
+            headers=auth_headers,
+        ).json()
+
+        assert body["config_generation"] == 2
+        assert body["consecutive_failures"] == 0
 
     def test_sets_the_printer_scope(
         self, client: TestClient, auth_headers: dict[str, str], channel_id: int

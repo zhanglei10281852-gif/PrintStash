@@ -911,6 +911,29 @@ def set_notifications_enabled(session: Session, enabled: bool) -> SystemConfig:
     return config
 
 
+def notifications_generation_protection_enabled(session: Session) -> bool:
+    """Whether outboxed deliveries are pinned to their enqueue-time generation.
+
+    On by default. When off, deliveries follow the channel's live
+    configuration (legacy behaviour); see ``NotificationDelivery``'s snapshot
+    columns for what pinning guarantees.
+    """
+    config = session.get(SystemConfig, 1)
+    return True if config is None else bool(config.notifications_generation_protection)
+
+
+def set_notifications_generation_protection(
+    session: Session, enabled: bool
+) -> SystemConfig:
+    config = get_or_create(session)
+    config.notifications_generation_protection = enabled
+    config.updated_at = utcnow()
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+    return config
+
+
 def spoolman_enabled(session: Session) -> bool:
     """Master opt-in switch for the Spoolman integration. Off by default."""
     config = session.get(SystemConfig, 1)
@@ -1116,6 +1139,9 @@ def get_effective_config(session: Session) -> dict:
         "auto_mark_known_good": auto_mark_known_good_enabled(session),
         "external_libraries_enabled": external_libraries_enabled(session),
         "notifications_enabled": notifications_enabled(session),
+        "notifications_generation_protection": (
+            notifications_generation_protection_enabled(session)
+        ),
         "spoolman_enabled": spoolman_enabled(session),
         "currency": currency(session),
         "oidc_enabled": bool(settings.oidc_enabled),

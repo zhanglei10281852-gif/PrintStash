@@ -24,7 +24,10 @@ from app.db.models import (
     Printer,
     PrinterStatus,
 )
-from app.modules.administration.runtime_config import set_notifications_enabled
+from app.modules.administration.runtime_config import (
+    set_notifications_enabled,
+    set_notifications_generation_protection,
+)
 from app.modules.notifications import notifications
 from tests.factories import build_printer, build_user
 
@@ -367,6 +370,11 @@ class TestClaimDelivery:
             event_type=NotificationEventType.PRINTER_OFFLINE,
             status=NotificationDeliveryStatus.PENDING,
             context_json="not json either",
+            # The bound snapshot is what the dispatcher renders with now; a
+            # corrupt one degrades to {} rather than redirecting to live config.
+            channel_target=NotificationTarget.WEBHOOK,
+            channel_config_json="not json",
+            channel_config_generation=1,
         )
         db_session.add(delivery)
         db_session.commit()
@@ -400,7 +408,9 @@ class TestClaimDelivery:
 class TestRecordResult:
     def test_record_result_noop_when_delivery_missing(self):
         # Must not raise even though the delivery id doesn't exist.
-        notifications._record_result(999_999_999, 1, success=True, error=None)
+        notifications._record_result(
+            999_999_999, 1, "claim-token", success=True, error=None
+        )
 
 
 class TestParseRetryAfter:
@@ -797,6 +807,9 @@ def _delivery(session, channel, **fields):
     row = NotificationDelivery(
         channel_id=channel.id,
         event_type=NotificationEventType.PRINTER_OFFLINE,
+        channel_target=channel.target,
+        channel_config_json=channel.config_json,
+        channel_config_generation=channel.config_generation,
         **fields,
     )
     session.add(row)
@@ -1246,3 +1259,530 @@ class TestEvent:
         hub._sync_active_job_db(p.id, "cancelled", "y.gcode", 0.4, stats)
         db_session.expire_all()
         assert _deliveries(db_session) == []
+
+
+# --------------------------------------------------------------------------- #
+# Configuration generations: an outboxed event is bound to the target, auth
+# config and generation in effect when it entered the box, for its whole life.
+# --------------------------------------------------------------------------- #
+
+URL_A = "https://hooks-a.example.test/vault"
+URL_B = "https://hooks-b.example.test/vault"
+
+
+def _enqueue_offline(session, printer, *, url=URL_A):
+    ch = _channel(
+        session,
+        events=[NotificationEventType.PRINTER_OFFLINE],
+        config={"url": url},
+    )
+    notifications.enqueue_for_event(
+        session, NotificationEventType.PRINTER_OFFLINE, printer_id=printer.id
+    )
+    session.commit()
+    return ch
+
+
+class TestConfigGenerationBinding:
+    def test_enqueue_binds_the_channels_target_config_and_generation(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer)
+
+        d = _deliveries(db_session, ch.id)[0]
+        assert d.channel_target == NotificationTarget.WEBHOOK
+        assert json.loads(d.channel_config_json) == {"url": URL_A}
+        assert d.channel_config_generation == 1
+
+    def test_new_events_after_an_edit_bind_the_new_generation(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+
+        notifications.enqueue_for_event(
+            db_session, NotificationEventType.PRINTER_OFFLINE, printer_id=printer.id
+        )
+        db_session.commit()
+
+        db_session.expire_all()
+        rows = _deliveries(db_session, ch.id)
+        assert [r.channel_config_generation for r in rows] == [1, 2]
+        assert json.loads(rows[0].channel_config_json) == {"url": URL_A}
+        assert json.loads(rows[1].channel_config_json) == {"url": URL_B}
+
+
+class TestDeliveryFollowsBoundGeneration:
+    def test_send_after_a_config_edit_goes_to_the_bound_old_url(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+
+        client = _http_returning(204)
+        with patch.object(notifications, "_client_for", new=_client_factory(client)):
+            _deliver_due()
+
+        assert client.request.call_args.args[1] == URL_A
+        db_session.expire_all()
+        delivery = _deliveries(db_session, ch.id)[0]
+        assert delivery.status == NotificationDeliveryStatus.SENT
+        db_session.refresh(ch)
+        # The old generation's success does not touch the new generation's
+        # displayed status or breaker.
+        assert ch.config_generation == 2
+        assert ch.last_status is None
+        assert ch.last_delivered_at is None
+        assert ch.consecutive_failures == 0
+
+    def test_429_then_success_stays_on_the_bound_generation(
+        self, printer: Printer, db_session
+    ):
+        from app.core.time import ensure_utc, utcnow
+        from app.modules.work.async_steps import run_async
+
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+        d = _deliveries(db_session, ch.id)[0]
+
+        rate_limited = _http_returning(429, headers={"Retry-After": "0"})
+        with patch.object(
+            notifications, "_client_for", new=_client_factory(rate_limited)
+        ):
+            run_async(notifications._send_one(notifications._claim_delivery(d.id)))
+        db_session.expire_all()
+        d = _deliveries(db_session, ch.id)[0]
+        assert d.status == NotificationDeliveryStatus.PENDING
+        assert d.attempts == 0  # a rate limit does not spend the retry budget
+        assert ensure_utc(d.next_retry_at) <= utcnow()
+        assert rate_limited.request.call_args.args[1] == URL_A
+
+        ok = _http_returning(204)
+        with patch.object(notifications, "_client_for", new=_client_factory(ok)):
+            run_async(notifications._send_one(notifications._claim_delivery(d.id)))
+        assert ok.request.call_args.args[1] == URL_A
+        db_session.expire_all()
+        assert _deliveries(db_session, ch.id)[0].status == (
+            NotificationDeliveryStatus.SENT
+        )
+
+    def test_a_reclaimed_stale_send_uses_the_bound_snapshot(
+        self, printer: Printer, db_session
+    ):
+        from datetime import timedelta
+
+        from app.core.time import utcnow
+
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+        d = _deliveries(db_session, ch.id)[0]
+        d.status = NotificationDeliveryStatus.SENDING
+        d.updated_at = utcnow() - timedelta(
+            seconds=notifications._STUCK_SENDING_SECONDS + 60
+        )
+        db_session.add(d)
+        db_session.commit()
+
+        client = _http_returning(204)
+        with patch.object(notifications, "_client_for", new=_client_factory(client)):
+            attempted = _deliver_due()
+
+        assert attempted == 1
+        assert client.request.call_args.args[1] == URL_A
+        db_session.refresh(d)
+        assert d.status == NotificationDeliveryStatus.SENT
+
+    def test_old_generation_failure_does_not_trip_the_new_breaker(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+        # The new generation already carries a near-threshold count: an old
+        # generation's terminal failure must not push it over.
+        ch.consecutive_failures = notifications._CIRCUIT_BREAKER_THRESHOLD - 1
+        db_session.add(ch)
+        db_session.commit()
+        d = _deliveries(db_session, ch.id)[0]
+        d.attempts = notifications._MAX_ATTEMPTS - 1
+        db_session.add(d)
+        db_session.commit()
+
+        with patch.object(
+            notifications, "_client_for", new=_client_factory(_http_returning(500))
+        ):
+            _deliver_due()
+
+        db_session.expire_all()
+        assert _deliveries(db_session, ch.id)[0].status == (
+            NotificationDeliveryStatus.FAILED
+        )
+        db_session.refresh(ch)
+        assert ch.consecutive_failures == (notifications._CIRCUIT_BREAKER_THRESHOLD - 1)
+        assert ch.enabled is True
+
+
+class TestChannelGenerationLifecycle:
+    def test_material_config_edit_bumps_generation_and_resets_health(
+        self, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        ch.consecutive_failures = 5
+        ch.last_status = "failed"
+        ch.last_error = "HTTP 500: boom"
+        db_session.add(ch)
+        db_session.commit()
+
+        updated = notifications.update_channel(
+            db_session, ch, config={"url": URL_B}
+        )
+
+        assert updated.config_generation == 2
+        assert updated.consecutive_failures == 0
+        assert updated.last_status is None
+        assert updated.last_error is None
+
+    def test_re_enable_bumps_generation_and_resets_health(self, db_session):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        ch.enabled = False
+        ch.consecutive_failures = notifications._CIRCUIT_BREAKER_THRESHOLD
+        db_session.add(ch)
+        db_session.commit()
+
+        updated = notifications.update_channel(db_session, ch, enabled=True)
+
+        assert updated.enabled is True
+        assert updated.config_generation == 2
+        assert updated.consecutive_failures == 0
+
+    @pytest.mark.parametrize(
+        ("field", "kwargs"),
+        [
+            pytest.param("name", {"name": "renamed"}, id="name"),
+            pytest.param(
+                "events",
+                {"events": ["print_completed"]},
+                id="events",
+            ),
+            pytest.param(
+                "printer_scope",
+                {"printer_ids": [42], "printer_ids_set": True},
+                id="printer_scope",
+            ),
+        ],
+    )
+    def test_a_non_routing_edit_keeps_the_generation(
+        self, db_session, field: str, kwargs: dict
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        ch.last_status = "sent"
+        db_session.add(ch)
+        db_session.commit()
+
+        updated = notifications.update_channel(db_session, ch, **kwargs)
+
+        assert updated.config_generation == 1
+        assert updated.last_status == "sent"
+
+    def test_resaving_a_masked_secret_keeps_the_generation(self, db_session):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(
+            db_session,
+            events=[NotificationEventType.PRINTER_OFFLINE],
+            config={"url": URL_A},
+        )
+
+        updated = notifications.update_channel(
+            db_session, ch, config={"url": "********"}
+        )
+
+        assert updated.config_generation == 1
+        assert json.loads(updated.config_json) == {"url": URL_A}
+
+
+class TestChannelDeletion:
+    def test_delete_closes_in_flight_deliveries_but_keeps_history(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(
+            db_session,
+            events=[
+                NotificationEventType.PRINTER_OFFLINE,
+                NotificationEventType.PRINT_COMPLETED,
+            ],
+        )
+        notifications.enqueue_for_event(
+            db_session, NotificationEventType.PRINTER_OFFLINE, printer_id=printer.id
+        )
+        notifications.enqueue_for_event(
+            db_session, NotificationEventType.PRINT_COMPLETED, printer_id=printer.id
+        )
+        db_session.commit()
+        in_flight, history = _deliveries(db_session, ch.id)
+        history.status = NotificationDeliveryStatus.SENT
+        db_session.add(history)
+        db_session.commit()
+
+        notifications.delete_channel(db_session, ch)
+
+        db_session.expire_all()
+        rows = _deliveries(db_session)
+        assert {r.id for r in rows} == {in_flight.id, history.id}
+        closed = next(r for r in rows if r.id == in_flight.id)
+        assert closed.status == NotificationDeliveryStatus.FAILED
+        assert closed.last_error == "channel deleted"
+        assert closed.claim_token is None
+        kept = next(r for r in rows if r.id == history.id)
+        assert kept.status == NotificationDeliveryStatus.SENT
+        assert kept.channel_id is None
+
+    def test_an_orphaned_delivery_is_closed_observably_on_its_next_claim(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _enqueue_offline(db_session, printer)
+        d = _deliveries(db_session, ch.id)[0]
+        # Protection off: deleting leaves the row pending (the legacy default).
+        notifications.delete_channel(db_session, ch)
+
+        orphaned = db_session.get(NotificationDelivery, d.id)
+        assert orphaned is not None
+        assert orphaned.status == NotificationDeliveryStatus.PENDING
+
+        set_notifications_generation_protection(db_session, True)
+        assert notifications._claim_delivery(d.id) is None
+
+        db_session.refresh(orphaned)
+        assert orphaned.status == NotificationDeliveryStatus.FAILED
+        assert orphaned.last_error == "channel deleted"
+
+    def test_delete_succeeds_while_delivery_history_exists(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        ch = _enqueue_offline(db_session, printer)
+        d = _deliveries(db_session, ch.id)[0]
+        d.status = NotificationDeliveryStatus.SENT
+        db_session.add(d)
+        db_session.commit()
+
+        notifications.delete_channel(db_session, ch)
+
+        assert notifications.get_channel(db_session, ch.id) is None
+
+
+class TestLegacyGenerationRows:
+    def test_a_row_without_a_bound_generation_fails_closed(self, db_session):
+        set_notifications_enabled(db_session, True)
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        delivery = NotificationDelivery(
+            channel_id=ch.id,
+            event_type=NotificationEventType.PRINTER_OFFLINE,
+            status=NotificationDeliveryStatus.PENDING,
+        )
+        db_session.add(delivery)
+        db_session.commit()
+
+        assert notifications._claim_delivery(delivery.id) is None
+
+        db_session.refresh(delivery)
+        assert delivery.status == NotificationDeliveryStatus.FAILED
+        assert delivery.last_error == (
+            "channel configuration generation unavailable"
+        )
+
+    def test_a_row_without_a_bound_generation_follows_live_config_when_protection_off(
+        self, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _channel(
+            db_session,
+            events=[NotificationEventType.PRINTER_OFFLINE],
+            config={"url": URL_A},
+        )
+        delivery = NotificationDelivery(
+            channel_id=ch.id,
+            event_type=NotificationEventType.PRINTER_OFFLINE,
+            status=NotificationDeliveryStatus.PENDING,
+        )
+        db_session.add(delivery)
+        db_session.commit()
+
+        item = notifications._claim_delivery(delivery.id)
+
+        assert item is not None
+        assert item["config"] == {"url": URL_A}
+        assert item["config_generation"] == 1
+
+
+class TestClaimFence:
+    def test_a_second_concurrent_claim_of_a_due_row_does_not_win(self, db_session):
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        row = _delivery(db_session, ch, status=NotificationDeliveryStatus.PENDING)
+
+        first = notifications._claim_delivery(row.id)
+        second = notifications._claim_delivery(row.id)
+
+        assert first is not None and first["claim_token"]
+        assert second is None
+
+    def test_duplicate_stale_reclamation_only_one_claim_survives(
+        self, db_session
+    ):
+        from datetime import timedelta
+
+        from app.core.time import utcnow
+
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        row = _delivery(
+            db_session,
+            ch,
+            status=NotificationDeliveryStatus.SENDING,
+            claim_token="lost-attempt",
+            updated_at=utcnow()
+            - timedelta(seconds=notifications._STUCK_SENDING_SECONDS + 60),
+        )
+
+        first = notifications._claim_delivery(row.id)
+        second = notifications._claim_delivery(row.id)
+
+        assert first is not None and second is None
+        assert first["claim_token"] != "lost-attempt"
+        db_session.refresh(row)
+        assert row.claim_token == first["claim_token"]
+        assert row.status == NotificationDeliveryStatus.SENDING
+
+    def test_a_result_carrying_a_stale_token_is_discarded(self, db_session):
+        from datetime import timedelta
+
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        row = _delivery(db_session, ch, status=NotificationDeliveryStatus.PENDING)
+
+        first = notifications._claim_delivery(row.id)
+        # The first attempt dies mid-send; its row goes stale and a reclaimer
+        # wins the fence before the lost attempt reports back.
+        row.updated_at = row.updated_at - timedelta(
+            seconds=notifications._STUCK_SENDING_SECONDS + 60
+        )
+        db_session.add(row)
+        db_session.commit()
+        second = notifications._claim_delivery(row.id)
+        assert second is not None and second["claim_token"] != first["claim_token"]
+
+        notifications._record_result(
+            row.id,
+            ch.id,
+            first["claim_token"],
+            success=True,
+            error=None,
+        )
+        db_session.refresh(row)
+        assert row.status == NotificationDeliveryStatus.SENDING
+        assert row.delivered_at is None
+
+        notifications._record_result(
+            row.id,
+            ch.id,
+            second["claim_token"],
+            success=True,
+            error=None,
+        )
+        db_session.refresh(row)
+        assert row.status == NotificationDeliveryStatus.SENT
+        assert row.delivered_at is not None
+
+    def test_cancelling_withdraws_the_fence_from_a_late_result(self, db_session):
+        ch = _channel(db_session, events=[NotificationEventType.PRINTER_OFFLINE])
+        row = _delivery(db_session, ch, status=NotificationDeliveryStatus.PENDING)
+        item = notifications._claim_delivery(row.id)
+        assert item is not None
+        subject = f"channel/{ch.id}/delivery/{row.id}"
+
+        notifications._cancel_delivery(db_session, subject)
+        db_session.commit()
+        notifications._record_result(
+            row.id, ch.id, item["claim_token"], success=True, error=None
+        )
+
+        db_session.refresh(row)
+        assert row.status == NotificationDeliveryStatus.FAILED
+        assert row.last_error == "cancelled"
+        assert row.delivered_at is None
+
+
+class TestGenerationProtectionOff:
+    def test_a_delivery_follows_the_live_url_after_an_edit(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+
+        client = _http_returning(204)
+        with patch.object(notifications, "_client_for", new=_client_factory(client)):
+            _deliver_due()
+
+        assert client.request.call_args.args[1] == URL_B
+        db_session.refresh(ch)
+        assert ch.last_status == "sent"
+
+    def test_an_old_generation_failure_updates_the_live_breaker(
+        self, printer: Printer, db_session
+    ):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _enqueue_offline(db_session, printer, url=URL_A)
+        notifications.update_channel(db_session, ch, config={"url": URL_B})
+        d = _deliveries(db_session, ch.id)[0]
+        d.attempts = notifications._MAX_ATTEMPTS - 1
+        db_session.add(d)
+        db_session.commit()
+
+        with patch.object(
+            notifications, "_client_for", new=_client_factory(_http_returning(500))
+        ):
+            _deliver_due()
+
+        db_session.refresh(ch)
+        assert ch.consecutive_failures == 1
+
+    def test_retry_mechanics_are_unchanged(self, printer: Printer, db_session):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _enqueue_offline(db_session, printer)
+
+        client = _http_returning(500, "boom")
+        with patch.object(notifications, "_client_for", new=_client_factory(client)):
+            _deliver_due()
+
+        headers = client.request.call_args.kwargs["headers"]
+        d = _deliveries(db_session, ch.id)[0]
+        assert headers["Idempotency-Key"] == f"printstash-delivery-{d.id}"
+        assert d.attempts == 1
+        assert d.status == NotificationDeliveryStatus.PENDING
+        # The body snapshot is still the enqueue-time event context.
+        assert json.loads(d.context_json)["event"] == "printer_offline"
+
+    def test_a_deleted_channel_stays_unclaimed(self, printer: Printer, db_session):
+        set_notifications_enabled(db_session, True)
+        set_notifications_generation_protection(db_session, False)
+        ch = _enqueue_offline(db_session, printer)
+        d = _deliveries(db_session, ch.id)[0]
+        notifications.delete_channel(db_session, ch)
+
+        assert notifications._claim_delivery(d.id) is None
+        db_session.expire_all()
+        orphaned = db_session.get(NotificationDelivery, d.id)
+        assert orphaned.status == NotificationDeliveryStatus.PENDING

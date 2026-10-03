@@ -35,6 +35,18 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
   will be removed in 0.16.
 
 ### Fixed
+- Notification deliveries already in the outbox are bound to the channel target,
+  encrypted connection config and configuration generation they were enqueued
+  with: editing, disabling or deleting a channel can no longer redirect a queued
+  event to the new endpoint; 429/503 backoff, stuck-send reclamation and process
+  restart continue along the original generation; and an old generation's
+  failures no longer trip the circuit breaker or overwrite a new configuration's
+  last-status. Deleting a channel closes its in-flight deliveries with an
+  observable "channel deleted" result while retaining history, and the atomic
+  claim with its rotating fence token prevents concurrent claims and duplicate
+  reclamation from sending twice. A new `generation_protection` setting (on by
+  default) restores the previous follow-live-config behaviour when turned off;
+  body snapshots, idempotency keys and retry budgets are unchanged.
 - Containers start with read-only Library source mounts beneath `/data`. Startup
   ownership repair is limited to app-owned directories and preserves external
   sources, including bind mounts on the same filesystem (#330).

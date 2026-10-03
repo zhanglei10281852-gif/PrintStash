@@ -57,6 +57,7 @@ function aChannel(over: Partial<NotificationChannel> = {}): NotificationChannel 
     last_error: null,
     last_delivered_at: FROZEN_NOW,
     consecutive_failures: 0,
+    config_generation: 1,
     ...over,
   };
 }
@@ -70,6 +71,7 @@ function aDelivery(over: Partial<NotificationDelivery> = {}): NotificationDelive
     status: "sent",
     attempts: 1,
     last_error: null,
+    config_generation: 1,
     created_at: FROZEN_NOW,
     delivered_at: FROZEN_NOW,
     ...over,
@@ -84,10 +86,21 @@ function stubDeps(over: Partial<NotificationsPanelDeps> = {}): NotificationsPane
   return {
     getNotificationsSettings: vi
       .fn<() => Promise<NotificationsSettings>>()
-      .mockResolvedValue({ enabled: true, channels: [aChannel()] }),
+      .mockResolvedValue({
+        enabled: true,
+        generation_protection: true,
+        channels: [aChannel()],
+      }),
     setNotificationsEnabled: vi
       .fn<(enabled: boolean) => Promise<NotificationsSettings>>()
-      .mockResolvedValue({ enabled: false, channels: [] }),
+      .mockResolvedValue({ enabled: false, generation_protection: true, channels: [] }),
+    setNotificationsGenerationProtection: vi
+      .fn<(generationProtection: boolean, enabled: boolean) => Promise<NotificationsSettings>>()
+      .mockResolvedValue({
+        enabled: true,
+        generation_protection: false,
+        channels: [aChannel()],
+      }),
     createNotificationChannel: vi
       .fn<(body: NotificationChannelCreate) => Promise<NotificationChannel>>()
       .mockResolvedValue(aChannel()),
@@ -152,17 +165,19 @@ describe("NotificationsPanel", () => {
       expect(screen.getByText("Loading…")).toBeInTheDocument();
     });
 
+    const MASTER_SWITCH = "Enable notifications";
+
     it("reads as on when notifications are enabled", async () => {
       renderPanel();
 
-      expect(await screen.findByRole("checkbox")).toBeChecked();
+      expect(await screen.findByRole("checkbox", { name: MASTER_SWITCH })).toBeChecked();
     });
 
     it("turns notifications off when the operator asks", async () => {
       const user = userEvent.setup();
       const { deps } = renderPanel();
 
-      await user.click(await screen.findByRole("checkbox"));
+      await user.click(await screen.findByRole("checkbox", { name: MASTER_SWITCH }));
 
       await waitFor(() => expect(deps.setNotificationsEnabled).toHaveBeenCalledWith(false));
     });
@@ -176,7 +191,60 @@ describe("NotificationsPanel", () => {
           .fn<(enabled: boolean) => Promise<NotificationsSettings>>()
           .mockRejectedValue(new Error("nope")),
       });
-      const toggle = await screen.findByRole("checkbox");
+      const toggle = await screen.findByRole("checkbox", { name: MASTER_SWITCH });
+
+      await user.click(toggle);
+
+      await waitFor(() => expect(toggle).toBeChecked());
+    });
+  });
+
+  describe("configuration generation protection", () => {
+    const PROTECTION_SWITCH =
+      "Pin queued notifications to their channel configuration";
+
+    it("reads as on by default", async () => {
+      renderPanel();
+
+      expect(await screen.findByRole("checkbox", { name: PROTECTION_SWITCH })).toBeChecked();
+    });
+
+    it("reflects an installation that turned it off", async () => {
+      renderPanel({
+        getNotificationsSettings: vi
+          .fn<() => Promise<NotificationsSettings>>()
+          .mockResolvedValue({
+            enabled: true,
+            generation_protection: false,
+            channels: [aChannel()],
+          }),
+      });
+
+      expect(await screen.findByRole("checkbox", { name: PROTECTION_SWITCH })).not.toBeChecked();
+    });
+
+    it("sends the new preference alongside the master switch", async () => {
+      const user = userEvent.setup();
+      const { deps } = renderPanel();
+
+      await user.click(await screen.findByRole("checkbox", { name: PROTECTION_SWITCH }));
+
+      await waitFor(() =>
+        expect(deps.setNotificationsGenerationProtection).toHaveBeenCalledWith(
+          false,
+          true,
+        ),
+      );
+    });
+
+    it("leaves the toggle where it was when the server refuses", async () => {
+      const user = userEvent.setup();
+      renderPanel({
+        setNotificationsGenerationProtection: vi
+          .fn<() => Promise<NotificationsSettings>>()
+          .mockRejectedValue(new Error("nope")),
+      });
+      const toggle = await screen.findByRole("checkbox", { name: PROTECTION_SWITCH });
 
       await user.click(toggle);
 
@@ -209,7 +277,7 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi
           .fn<() => Promise<NotificationsSettings>>()
-          .mockResolvedValue({ enabled: true, channels: [aChannel({ printer_ids: [4, 5] })] }),
+          .mockResolvedValue({ enabled: true, generation_protection: true, channels: [aChannel({ printer_ids: [4, 5] })] }),
       });
 
       expect(await screen.findByText(/2 printer\(s\)/)).toBeInTheDocument();
@@ -219,7 +287,7 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi
           .fn<() => Promise<NotificationsSettings>>()
-          .mockResolvedValue({ enabled: true, channels: [] }),
+          .mockResolvedValue({ enabled: true, generation_protection: true, channels: [] }),
       });
 
       expect(await screen.findByText("No notification channels yet")).toBeInTheDocument();
@@ -231,7 +299,8 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi.fn<() => Promise<NotificationsSettings>>().mockResolvedValue({
           enabled: true,
-          channels: [aChannel({ enabled: false, consecutive_failures: 5, last_error: "410" })],
+          generation_protection: true,
+          channels: [aChannel({ enabled: false, consecutive_failures: 5, last_error: "411" })],
         }),
       });
 
@@ -242,6 +311,7 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi.fn<() => Promise<NotificationsSettings>>().mockResolvedValue({
           enabled: true,
+          generation_protection: true,
           channels: [aChannel({ enabled: false, consecutive_failures: 0 })],
         }),
       });
@@ -259,6 +329,7 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi.fn<() => Promise<NotificationsSettings>>().mockResolvedValue({
           enabled: true,
+          generation_protection: true,
           channels: [aChannel({ last_status: "failed", last_error: "connection refused" })],
         }),
         listNotificationDeliveries: vi
@@ -273,7 +344,11 @@ describe("NotificationsPanel", () => {
       renderPanel({
         getNotificationsSettings: vi
           .fn<() => Promise<NotificationsSettings>>()
-          .mockResolvedValue({ enabled: true, channels: [aChannel({ last_status: null })] }),
+          .mockResolvedValue({
+            enabled: true,
+            generation_protection: true,
+            channels: [aChannel({ last_status: null })],
+          }),
         listNotificationDeliveries: vi
           .fn<(limit?: number) => Promise<NotificationDelivery[]>>()
           .mockResolvedValue([]),
@@ -618,10 +693,17 @@ describe("NotificationsPanel", () => {
       expect(screen.queryByRole("button", { name: /Add channel/ })).toBeNull();
     });
 
-    it("offers no master switch to flip", async () => {
+    it("offers no switch to flip", async () => {
       renderPanel({}, false);
 
-      expect(await screen.findByRole("checkbox")).toBeDisabled();
+      expect(
+        await screen.findByRole("checkbox", { name: "Enable notifications" }),
+      ).toBeDisabled();
+      expect(
+        screen.getByRole("checkbox", {
+          name: "Pin queued notifications to their channel configuration",
+        }),
+      ).toBeDisabled();
     });
   });
 

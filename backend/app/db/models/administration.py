@@ -167,6 +167,15 @@ class SystemConfig(SQLModel, table=True):
     # and the dispatcher loop stays idle. Disabling never deletes channels.
     notifications_enabled: bool = Field(default=False)
 
+    # Bind each outboxed delivery to the channel generation it was enqueued
+    # under (target + config snapshot). On by default: editing, disabling or
+    # deleting a channel can never redirect in-flight events, and old
+    # generations' failures cannot pollute a new configuration's circuit
+    # breaker. Turn off only to restore the legacy "follow live config"
+    # behaviour. Body snapshots, idempotency keys and retry budgets are
+    # unaffected either way.
+    notifications_generation_protection: bool = Field(default=True)
+
     # ISO 4217 currency code used to render cost figures (statistics, filament
     # cost). ``None`` falls back to the default "USD".
     currency: Optional[str] = Field(default=None, max_length=3)

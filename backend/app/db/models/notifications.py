@@ -5,6 +5,8 @@ from typing import Optional
 
 from sqlalchemy import (
     Column,
+    ForeignKey,
+    Integer,
     Text,
 )
 from sqlmodel import Field
@@ -54,6 +56,13 @@ class NotificationChannel(SQLModel, table=True):
     # a dead endpoint stops generating failures for every event.
     consecutive_failures: int = Field(default=0)
 
+    # Configuration generation. Every material routing/authentication edit (and
+    # every re-enable) starts a new generation: deliveries already in the outbox
+    # keep delivering to the target/config they were enqueued with, and only
+    # same-generation outcomes may touch last_status/consecutive_failures, so a
+    # new generation always begins from independent health state.
+    config_generation: int = Field(default=1)
+
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -68,13 +77,34 @@ class NotificationDelivery(SQLModel, table=True):
     ``next_retry_at <= now`` and delivers them with exponential backoff.
 
     ``context_json`` snapshots the rendered event context at enqueue time so a
-    later channel-config edit can't retroactively change a queued payload.
+    later channel-config edit can't retroactively change a queued payload. The
+    ``channel_*`` snapshot columns do the same for *where and how* the event is
+    delivered — target, encrypted connection config and the channel's
+    configuration generation — so an admin edit, disable or delete can never
+    redirect an outboxed event: its whole lifecycle (send, 429/503 backoff,
+    stuck-send reclamation, process restart) continues along the generation it
+    was enqueued under. ``channel_id`` is SET NULL on channel deletion; the
+    snapshot keeps the row's identity and an in-flight row is closed with an
+    observable failure instead of being silently redirected.
+
+    ``claim_token`` fences the send claim: the conditional claim rotates it per
+    claim, so concurrent claims and duplicate reclamation of a stale SENDING row
+    cannot produce a second external send, and a result arriving with a stale
+    token (from an attempt that lost the claim) is discarded.
     """
 
     __tablename__ = "notification_deliveries"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    channel_id: int = Field(foreign_key="notification_channels.id", index=True)
+    channel_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("notification_channels.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
     event_type: NotificationEventType = Field(index=True)
     printer_id: Optional[int] = Field(
         default=None, foreign_key="printers.id", index=True
@@ -82,6 +112,16 @@ class NotificationDelivery(SQLModel, table=True):
     print_job_id: Optional[int] = Field(
         default=None, foreign_key="print_jobs.id", index=True
     )
+
+    # Bound channel generation: target + encrypted config as they were when the
+    # event entered the outbox, and the generation they belong to. NULL only for
+    # rows predating the migration that could not be backfilled (their channel
+    # was already gone), which fail observably rather than following live config.
+    channel_target: Optional[NotificationTarget] = Field(default=None)
+    channel_config_json: Optional[str] = Field(
+        default=None, sa_column=Column(EncryptedText(), nullable=True)
+    )
+    channel_config_generation: Optional[int] = Field(default=None)
 
     context_json: str = Field(default="{}", sa_column=Column(Text))
 
@@ -92,6 +132,10 @@ class NotificationDelivery(SQLModel, table=True):
     last_error: Optional[str] = Field(default=None, max_length=1024)
     next_retry_at: datetime = Field(default_factory=utcnow, index=True)
     delivered_at: Optional[datetime] = Field(default=None)
+
+    # Opaque fence token of the claim currently allowed to send/record. NULL
+    # when no claim is active (PENDING due later, or a terminal row).
+    claim_token: Optional[str] = Field(default=None, max_length=64, index=True)
 
     created_at: datetime = Field(default_factory=utcnow, index=True)
     updated_at: datetime = Field(default_factory=utcnow)

@@ -5,7 +5,7 @@ import { uiText } from "@/lib/locale";
 import { useUiLocale } from "@/lib/i18n";
 
 import { useCallback, useEffect, useState } from "react";
-import { Bell, Loader2, Plus, Send, Trash2, Pencil } from "lucide-react";
+import { Bell, Loader2, Plus, Send, ShieldCheck, Trash2, Pencil } from "lucide-react";
 import {
   createNotificationChannel,
   deleteNotificationChannel,
@@ -13,6 +13,7 @@ import {
   listNotificationDeliveries,
   listPrinters,
   setNotificationsEnabled,
+  setNotificationsGenerationProtection,
   testNotificationChannel,
   updateNotificationChannel,
 } from "@/lib/api";
@@ -273,6 +274,7 @@ function statusBadge(status: string | null): StatusBadge {
 export interface NotificationsPanelDeps {
   getNotificationsSettings: typeof getNotificationsSettings;
   setNotificationsEnabled: typeof setNotificationsEnabled;
+  setNotificationsGenerationProtection: typeof setNotificationsGenerationProtection;
   createNotificationChannel: typeof createNotificationChannel;
   updateNotificationChannel: typeof updateNotificationChannel;
   deleteNotificationChannel: typeof deleteNotificationChannel;
@@ -285,6 +287,7 @@ export interface NotificationsPanelDeps {
 const LIVE_DEPS: NotificationsPanelDeps = {
   getNotificationsSettings,
   setNotificationsEnabled,
+  setNotificationsGenerationProtection,
   createNotificationChannel,
   updateNotificationChannel,
   deleteNotificationChannel,
@@ -303,12 +306,13 @@ export function NotificationsPanel({
 }) {
   useUiLocale();
   const [enabled, setEnabled] = useState(false);
+  const [generationProtection, setGenerationProtection] = useState(true);
   const [channels, setChannels] = useState<NotificationChannel[]>([]);
   const [printers, setPrinters] = useState<PrinterRead[]>([]);
   const [deliveries, setDeliveries] = useState<NotificationDelivery[]>([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState<DraftState | null>(null);
-  const [busy, setBusy] = useState<number | "save" | "switch" | null>(null);
+  const [busy, setBusy] = useState<number | "save" | "switch" | "protection" | null>(null);
 
   // Promise chain rather than async/await: every state update then happens in a
   // resolution callback, so the mount effect below only kicks off the requests.
@@ -321,6 +325,7 @@ export function NotificationsPanel({
       ])
         .then(([settings, printerList, deliveryList]) => {
           setEnabled(settings.enabled);
+          setGenerationProtection(settings.generation_protection);
           setChannels(settings.channels);
           setPrinters(printerList);
           setDeliveries(deliveryList);
@@ -347,6 +352,21 @@ export function NotificationsPanel({
       }
     },
     [deps],
+  );
+
+  const toggleGenerationProtection = useCallback(
+    async (next: boolean) => {
+      setBusy("protection");
+      try {
+        await deps.setNotificationsGenerationProtection(next, enabled);
+        setGenerationProtection(next);
+      } catch (e) {
+        deps.toast.error(e);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [deps, enabled],
   );
 
   const startEdit = useCallback((ch: NotificationChannel) => {
@@ -453,6 +473,7 @@ export function NotificationsPanel({
           <label className="inline-flex items-center gap-2 flex-shrink-0">
             <input
               type="checkbox"
+              aria-label={uiText("Enable notifications")}
               checked={enabled}
               disabled={!canEdit || busy === "switch"}
               onChange={(e) => toggleEnabled(e.target.checked)}
@@ -460,6 +481,38 @@ export function NotificationsPanel({
             />
             <span className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
               {enabled ? uiText("On") : uiText("Off")}
+            </span>
+          </label>
+        </div>
+
+        {/* Configuration-generation protection */}
+        <div className={`${CARD} px-4 sm:px-6 py-4 flex items-center justify-between gap-3`}>
+          <div className="min-w-0 flex items-start gap-2">
+            <ShieldCheck className="h-4 w-4 mt-0.5 text-muted-foreground flex-shrink-0" />
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">
+                {uiText("Pin alerts to their channel configuration")}
+              </h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {uiText(
+                  "On by default: editing, disabling or deleting a channel never redirects events already queued, and failures from an old configuration cannot trip the new one's failure counter. Turn off to have queued events follow the current configuration.",
+                )}
+              </p>
+            </div>
+          </div>
+          <label className="inline-flex items-center gap-2 flex-shrink-0">
+            <input
+              type="checkbox"
+              aria-label={uiText(
+                "Pin queued notifications to their channel configuration",
+              )}
+              checked={generationProtection}
+              disabled={!canEdit || busy === "protection"}
+              onChange={(e) => toggleGenerationProtection(e.target.checked)}
+              className="h-4 w-4 accent-primary"
+            />
+            <span className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
+              {generationProtection ? uiText("On") : uiText("Off")}
             </span>
           </label>
         </div>

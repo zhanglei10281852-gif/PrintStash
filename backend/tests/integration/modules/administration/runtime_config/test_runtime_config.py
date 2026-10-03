@@ -204,6 +204,11 @@ _BOOLEAN_TOGGLES = [
     ("auto_mark_known_good_enabled", "set_auto_mark_known_good", True),
     ("external_libraries_enabled", "set_external_libraries_enabled", False),
     ("notifications_enabled", "set_notifications_enabled", False),
+    (
+        "notifications_generation_protection_enabled",
+        "set_notifications_generation_protection",
+        True,
+    ),
     ("spoolman_enabled", "set_spoolman_enabled", False),
     ("spoolman_write_enabled", "set_spoolman_write_enabled", False),
     ("spoolman_write_force", "set_spoolman_write_force", False),

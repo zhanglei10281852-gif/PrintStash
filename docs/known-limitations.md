@@ -189,6 +189,14 @@ manufacturing platform.
   once, so receivers should de-duplicate on the `Idempotency-Key` header.
 - The dispatcher is built for the supported single-process deployment. Its
   database claim remains defensive, but horizontal API scaling is not supported.
+- Alerts already queued stay bound to the channel configuration (endpoint and
+  credentials) they were enqueued under. Editing the URL or auth, disabling or
+  deleting a channel never redirects an event that is waiting, backing off or
+  being retried; an in-flight event whose channel is deleted is recorded as
+  failed ("channel deleted") rather than sent anywhere, and the new
+  configuration starts with its own failure counter. Turn off "Pin alerts to
+  their channel configuration" only if queued alerts should follow the current
+  configuration instead.
 - Message formatting is fixed (no per-channel templates), the event set is the
   four above, and there is no separate "printer back online" event.
 - An auto-disabled channel is not re-enabled automatically and does not raise a

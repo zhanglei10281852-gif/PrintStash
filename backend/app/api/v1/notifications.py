@@ -27,12 +27,16 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 # --------------------------------------------------------------------------- #
 class NotificationsSettings(BaseModel):
     enabled: bool = False
+    # Whether outboxed deliveries are pinned to their enqueue-time channel
+    # generation; read-only here except through the PUT field below.
+    generation_protection: bool = True
 
 
 class NotificationsSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+    generation_protection: Optional[bool] = None
 
 
 class ChannelCreate(BaseModel):
@@ -67,6 +71,9 @@ class ChannelUpdate(BaseModel):
 def get_settings(session: Session = Depends(get_session)) -> Dict[str, Any]:
     return {
         "enabled": runtime_config.notifications_enabled(session),
+        "generation_protection": (
+            runtime_config.notifications_generation_protection_enabled(session)
+        ),
         "channels": notifications.list_channels(session),
     }
 
@@ -80,7 +87,16 @@ def update_settings(
     body: NotificationsSettingsUpdate, session: Session = Depends(get_session)
 ) -> NotificationsSettings:
     runtime_config.set_notifications_enabled(session, body.enabled)
-    return NotificationsSettings(enabled=body.enabled)
+    if body.generation_protection is not None:
+        runtime_config.set_notifications_generation_protection(
+            session, body.generation_protection
+        )
+    return NotificationsSettings(
+        enabled=body.enabled,
+        generation_protection=runtime_config.notifications_generation_protection_enabled(
+            session
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

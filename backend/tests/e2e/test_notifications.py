@@ -20,6 +20,7 @@ from sqlmodel import select
 
 from app.db.models import (
     FileType,
+    NotificationChannel,
     NotificationDelivery,
     NotificationDeliveryStatus,
     NotificationEventType,
@@ -196,6 +197,60 @@ class TestNotificationDelivery:
         e2e_db.expire_all()
         d = e2e_db.exec(select(NotificationDelivery)).one()
         assert d.status == NotificationDeliveryStatus.SENT, d.last_error
+
+    @pytest.mark.asyncio
+    async def test_an_outboxed_event_keeps_its_endpoint_after_a_channel_edit(
+        self, api, fakes, superuser_headers, e2e_db
+    ):
+        """Generation pinning, end to end: an edit after enqueue never redirects.
+
+        The event enters the outbox bound to the ``/webhook`` endpoint; the
+        channel is then repointed at the Discord route before the Jobs run. The
+        delivery must still POST to the old endpoint exactly once, and its
+        success — belonging to the old generation — must not write the new
+        generation's health state.
+        """
+        await _enable(api, superuser_headers)
+        channel = await _create_channel(
+            api,
+            superuser_headers,
+            name="hook",
+            target="webhook",
+            config={"url": fakes.webhook_url},
+        )
+
+        printer_id, job = _seed_completed_job(
+            e2e_db, filename="pinned.gcode", printer_name="Pinner"
+        )
+        enqueued = notifications.enqueue_for_event(
+            e2e_db,
+            NotificationEventType.PRINT_COMPLETED,
+            printer_id=printer_id,
+            job=job,
+        )
+        e2e_db.commit()
+        assert enqueued == 1
+
+        patched = await api.patch(
+            f"{NOTIF_BASE}/channels/{channel['id']}",
+            json={"config": {"url": fakes.discord_url}},
+            headers=superuser_headers,
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["config_generation"] == 2
+
+        settle()
+
+        assert len(fakes.recorder.for_target("webhook")) == 1
+        assert fakes.recorder.for_target("discord") == []
+        e2e_db.expire_all()
+        delivery = e2e_db.exec(select(NotificationDelivery)).one()
+        assert delivery.status == NotificationDeliveryStatus.SENT
+        assert delivery.channel_config_generation == 1
+        stored = e2e_db.get(NotificationChannel, channel["id"])
+        assert stored is not None
+        assert stored.last_status is None
+        assert stored.consecutive_failures == 0
 
     @pytest.mark.asyncio
     async def test_ntfy_title_with_non_ascii_is_accepted(

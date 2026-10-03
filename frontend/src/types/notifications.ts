@@ -28,12 +28,16 @@ export interface NotificationChannel {
   last_status: string | null;
   last_error: string | null;
   last_delivered_at: string | null;
-  /** Consecutive permanently-failed deliveries; channel auto-disables past a threshold. */
+  /** Consecutively permanently-failed deliveries; channel auto-disables past a threshold. */
   consecutive_failures: number;
+  /** Configuration generation the channel's health state belongs to. */
+  config_generation: number;
 }
 
 export interface NotificationsSettings {
   enabled: boolean;
+  /** Outboxed deliveries stay bound to their enqueue-time channel generation. */
+  generation_protection: boolean;
   channels: NotificationChannel[];
 }
 
@@ -61,12 +65,14 @@ export interface NotificationTestResult {
 
 export interface NotificationDelivery {
   id: number;
-  channel_id: number;
+  channel_id: number | null;
   event_type: NotificationEvent;
   printer_id: number | null;
-  status: "pending" | "sent" | "failed";
+  status: "pending" | "sending" | "sent" | "failed";
   attempts: number;
   last_error: string | null;
+  /** Channel generation this delivery is bound to (null only for pre-upgrade rows). */
+  config_generation: number | null;
   created_at: string | null;
   delivered_at: string | null;
 }

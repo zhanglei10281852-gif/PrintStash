@@ -11437,6 +11437,11 @@
             "default": false,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "generation_protection": {
+            "default": true,
+            "title": "Generation Protection",
+            "type": "boolean"
           }
         },
         "title": "NotificationsSettings",
@@ -11448,6 +11453,17 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "generation_protection": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Protection"
           }
         },
         "required": [

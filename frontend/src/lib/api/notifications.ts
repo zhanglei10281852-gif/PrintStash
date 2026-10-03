@@ -18,6 +18,16 @@ export function setNotificationsEnabled(enabled: boolean): Promise<{ enabled: bo
   });
 }
 
+export function setNotificationsGenerationProtection(
+  generationProtection: boolean,
+  enabled: boolean,
+): Promise<NotificationsSettings> {
+  return sendJson<NotificationsSettings>("/api/v1/notifications", "PUT", {
+    enabled,
+    generation_protection: generationProtection,
+  });
+}
+
 export function createNotificationChannel(
   body: NotificationChannelCreate,
 ): Promise<NotificationChannel> {

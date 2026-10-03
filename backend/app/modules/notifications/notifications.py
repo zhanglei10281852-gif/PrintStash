@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from sqlmodel import Session, col, select
 
 from app.core.config import settings
@@ -41,6 +42,7 @@ from app.core.url_safety import (
     pinned_transport,
     resolve_public_target,
 )
+from app.db.affected import affected
 from app.db.models import (
     JobKind,
     Model,
@@ -53,7 +55,10 @@ from app.db.models import (
     PrintJob,
 )
 from app.db.session import get_session_factory
-from app.modules.administration.runtime_config import notifications_enabled
+from app.modules.administration.runtime_config import (
+    notifications_enabled,
+    notifications_generation_protection_enabled,
+)
 from app.modules.notifications import notification_renderers as renderers
 
 logger = get_logger(__name__)
@@ -84,6 +89,13 @@ _MAX_RETRY_AFTER_SECONDS = 3600
 _CIRCUIT_BREAKER_THRESHOLD = 10
 # Delivered/failed rows older than this are pruned by ``notifications.retention``.
 _DELIVERY_RETENTION_DAYS = 30
+
+# Observable terminal errors recorded on a delivery whose bound generation can
+# no longer be honoured. Both are permanent configuration outcomes, not network
+# faults: the row must close as a visible failure rather than wait silently or
+# be redirected to whatever the channel points at now.
+_ERROR_CHANNEL_DELETED = "channel deleted"
+_ERROR_GENERATION_UNAVAILABLE = "channel configuration generation unavailable"
 
 
 def _client_for(target: PinnedTarget) -> httpx.AsyncClient:
@@ -158,6 +170,21 @@ def build_context(
     return ctx
 
 
+def _generation_binding(channel: NotificationChannel) -> Dict[str, Any]:
+    """Target/config/generation snapshot a delivery is bound to for its whole life.
+
+    Copied into the outbox row at enqueue time so the delivery keeps using it
+    through sends, backoff, reclamation and restarts regardless of later
+    channel edits — when generation protection is on, the dispatcher never
+    reads the live channel row for routing.
+    """
+    return {
+        "channel_target": channel.target,
+        "channel_config_json": channel.config_json,
+        "channel_config_generation": channel.config_generation,
+    }
+
+
 def _channel_subscribes(
     channel: NotificationChannel,
     event_type: NotificationEventType,
@@ -221,6 +248,7 @@ def enqueue_for_event(
                 context_json=context_json,
                 status=NotificationDeliveryStatus.PENDING,
                 next_retry_at=now,
+                **_generation_binding(channel),
             )
         )
     logger.info(
@@ -242,7 +270,8 @@ def enqueue_for_event(
 
 def _record_result(
     delivery_id: int,
-    channel_id: int,
+    channel_id: Optional[int],
+    claim_token: str,
     *,
     success: bool,
     error: Optional[str],
@@ -250,6 +279,12 @@ def _record_result(
     retry_after: Optional[int] = None,
 ) -> None:
     """Persist a delivery attempt's outcome + the channel's last-status (thread-side).
+
+    ``claim_token`` is the fence returned by :func:`_claim_delivery`. A result
+    carrying anything but the row's current token comes from an attempt that
+    lost its claim (e.g. a stuck send reclaimed by a later Job) and is
+    discarded, so it can neither overwrite the new owner's state nor trigger a
+    second external effect.
 
     ``permanent`` marks a non-transient failure (e.g. invalid channel config or
     a blocked URL) that retrying cannot fix, so the delivery fails immediately
@@ -259,14 +294,28 @@ def _record_result(
 
     On a terminal failure the channel's ``consecutive_failures`` advances and,
     past ``_CIRCUIT_BREAKER_THRESHOLD``, the channel is auto-disabled; any
-    success resets the counter.
+    success resets the counter. With generation protection on, channel health
+    is written only by outcomes of the channel's *current* generation — an old
+    generation's send finishes its own delivery but never touches the status or
+    breaker of a configuration that superseded it.
     """
     now = utcnow()
     with get_session_factory().session() as session:
         delivery = session.get(NotificationDelivery, delivery_id)
-        channel = session.get(NotificationChannel, channel_id)
         if delivery is None:
             return
+        if delivery.claim_token != claim_token:
+            logger.info(
+                "discarded stale result for delivery %s: claim token changed",
+                delivery_id,
+            )
+            return
+        channel = (
+            session.get(NotificationChannel, channel_id)
+            if channel_id is not None
+            else None
+        )
+        protected = notifications_generation_protection_enabled(session)
         delivery.updated_at = now
         if success:
             delivery.attempts += 1
@@ -290,31 +339,42 @@ def _record_result(
             else:
                 delivery.status = NotificationDeliveryStatus.PENDING
                 delivery.next_retry_at = now + timedelta(seconds=delay)
+        if delivery.status in {
+            NotificationDeliveryStatus.SENT,
+            NotificationDeliveryStatus.FAILED,
+        }:
+            # Terminal: no claim is active until the row is pruned.
+            delivery.claim_token = None
         session.add(delivery)
         if channel is not None:
-            channel.last_status = delivery.status.value
-            channel.last_error = None if success else (error or "")[:1024]
-            channel.updated_at = now
-            if success:
-                channel.last_delivered_at = now
-                channel.consecutive_failures = 0
-            elif delivery.status == NotificationDeliveryStatus.FAILED:
-                channel.consecutive_failures += 1
-                if (
-                    channel.enabled
-                    and channel.consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD
-                ):
-                    channel.enabled = False
-                    channel.last_error = (
-                        f"auto-disabled after {channel.consecutive_failures} "
-                        f"consecutive failures: {error or ''}"
-                    )[:1024]
-                    logger.warning(
-                        "notification channel %s auto-disabled after %d failures",
-                        channel_id,
-                        channel.consecutive_failures,
-                    )
-            session.add(channel)
+            same_generation = (
+                not protected
+                or delivery.channel_config_generation == channel.config_generation
+            )
+            if same_generation:
+                channel.last_status = delivery.status.value
+                channel.last_error = None if success else (error or "")[:1024]
+                channel.updated_at = now
+                if success:
+                    channel.last_delivered_at = now
+                    channel.consecutive_failures = 0
+                elif delivery.status == NotificationDeliveryStatus.FAILED:
+                    channel.consecutive_failures += 1
+                    if (
+                        channel.enabled
+                        and channel.consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD
+                    ):
+                        channel.enabled = False
+                        channel.last_error = (
+                            f"auto-disabled after {channel.consecutive_failures} "
+                            f"consecutive failures: {error or ''}"
+                        )[:1024]
+                        logger.warning(
+                            "notification channel %s auto-disabled after %d failures",
+                            channel_id,
+                            channel.consecutive_failures,
+                        )
+                session.add(channel)
         session.commit()
 
 
@@ -341,6 +401,7 @@ async def _send_one(item: Dict[str, Any]) -> None:
     """Render and send a single delivery, then record the outcome."""
     delivery_id = item["delivery_id"]
     channel_id = item["channel_id"]
+    claim_token = item["claim_token"]
     try:
         req = renderers.render(item["target"], item["context"], item["config"])
     except renderers.RenderError as exc:
@@ -349,6 +410,7 @@ async def _send_one(item: Dict[str, Any]) -> None:
             _record_result,
             delivery_id,
             channel_id,
+            claim_token,
             success=False,
             error=str(exc),
             permanent=True,
@@ -367,6 +429,7 @@ async def _send_one(item: Dict[str, Any]) -> None:
             _record_result,
             delivery_id,
             channel_id,
+            claim_token,
             success=False,
             error=f"blocked: {host} is not a public host",
             permanent=True,
@@ -390,7 +453,12 @@ async def _send_one(item: Dict[str, Any]) -> None:
             )
         if 200 <= resp.status_code < 300:
             await asyncio.to_thread(
-                _record_result, delivery_id, channel_id, success=True, error=None
+                _record_result,
+                delivery_id,
+                channel_id,
+                claim_token,
+                success=True,
+                error=None,
             )
         else:
             retry_after = (
@@ -403,46 +471,134 @@ async def _send_one(item: Dict[str, Any]) -> None:
                 _record_result,
                 delivery_id,
                 channel_id,
+                claim_token,
                 success=False,
                 error=f"HTTP {resp.status_code}: {body}",
                 retry_after=retry_after,
             )
     except Exception as exc:  # noqa: BLE001 — network boundary
         await asyncio.to_thread(
-            _record_result, delivery_id, channel_id, success=False, error=str(exc)
+            _record_result,
+            delivery_id,
+            channel_id,
+            claim_token,
+            success=False,
+            error=str(exc),
         )
 
 
-def _claim_delivery(delivery_id: int) -> Dict[str, Any] | None:
-    """Claim one delivery for its Job: PENDING (or its own stale SENDING) -> SENDING.
+def _close_without_send(
+    session: Session,
+    delivery: NotificationDelivery,
+    error: str,
+    now: datetime,
+) -> None:
+    """Terminalize a claimable delivery that must never be sent (observable)."""
+    delivery.status = NotificationDeliveryStatus.FAILED
+    delivery.last_error = error[:1024]
+    delivery.claim_token = None
+    delivery.updated_at = now
+    session.add(delivery)
+    session.commit()
+    logger.info("delivery %s closed without a send: %s", delivery.id, error)
 
-    The Job's active-subject claim makes it the only sender of this delivery,
-    so a resubmitted Job may take back a SENDING row its lost attempt left.
+
+def _claim_delivery(delivery_id: int) -> Dict[str, Any] | None:
+    """Claim one delivery for its Job: PENDING (or a stale SENDING) -> SENDING.
+
+    The claim is a single conditional UPDATE that also rotates ``claim_token``,
+    so it is single-writer even without relying on the Job's active-subject
+    claim: two concurrent claimants of one due row, or two Jobs reclaiming the
+    same stuck SENDING row, cannot both win (reclaiming bumps ``updated_at``,
+    which makes the second reclaimer's stale-row predicate miss). Only the
+    returned token may record the outcome, so a duplicate claim can never lead
+    to a second external send.
+
+    With generation protection on, the send target/config come from the
+    delivery's enqueue-time snapshot and the live channel is used only to gate
+    health updates. A delivery whose channel is gone, or whose bound
+    generation predates the snapshot columns, is closed as an observable
+    failure here instead of being silently redirected.
     """
     now = utcnow()
+    token = secrets.token_hex(16)
     with get_session_factory().session() as session:
-        pair = session.exec(
-            select(NotificationDelivery, NotificationChannel)
-            .join(
-                NotificationChannel,
-                NotificationDelivery.channel_id == NotificationChannel.id,  # type: ignore[arg-type]
-            )
-            .where(NotificationDelivery.id == delivery_id)
-        ).first()
-        if pair is None:
-            return None
-        delivery, channel = pair
-        if delivery.status not in {
+        delivery = session.get(NotificationDelivery, delivery_id)
+        if delivery is None or delivery.status not in {
             NotificationDeliveryStatus.PENDING,
             NotificationDeliveryStatus.SENDING,
         }:
             return None
-        delivery.status = NotificationDeliveryStatus.SENDING
-        delivery.updated_at = now
-        session.add(delivery)
+        channel = (
+            session.get(NotificationChannel, delivery.channel_id)
+            if delivery.channel_id is not None
+            else None
+        )
+        protected = notifications_generation_protection_enabled(session)
+
+        if channel is None:
+            if protected:
+                # The bound channel is gone: record the cancellation visibly
+                # rather than leaving the row to be reported forever or sending
+                # it at whatever a recreated channel points at.
+                _close_without_send(session, delivery, _ERROR_CHANNEL_DELETED, now)
+            return None
+        if protected and (
+            delivery.channel_target is None
+            or delivery.channel_config_json is None
+            or delivery.channel_config_generation is None
+        ):
+            # A row written before bound generations existed and never
+            # backfilled: the configuration it was created for does not exist,
+            # so fail closed instead of following the live config.
+            _close_without_send(session, delivery, _ERROR_GENERATION_UNAVAILABLE, now)
+            return None
+
+        stuck_cutoff = now - timedelta(seconds=_STUCK_SENDING_SECONDS)
+        status_column = col(NotificationDelivery.status)
+        claimed = affected(
+            session,
+            update(NotificationDelivery)
+            .where(
+                col(NotificationDelivery.id) == delivery_id,
+                status_column.in_(
+                    [
+                        NotificationDeliveryStatus.PENDING,
+                        NotificationDeliveryStatus.SENDING,
+                    ]
+                ),
+                or_(
+                    status_column == NotificationDeliveryStatus.PENDING,
+                    col(NotificationDelivery.updated_at) < stuck_cutoff,
+                ),
+            )
+            .values(
+                status=NotificationDeliveryStatus.SENDING,
+                updated_at=now,
+                claim_token=token,
+            )
+            # Bulk statement: the WHERE must run in SQL (it compares datetimes
+            # and enum values the session's Python evaluator cannot), and
+            # nothing after this reads the claimed row through this session.
+            .execution_options(synchronize_session=False),
+        )
+        if claimed != 1:
+            # Lost the race to another claimant, or the SENDING row is still
+            # within the in-flight grace window.
+            return None
         session.commit()
+
+        if protected:
+            target = delivery.channel_target
+            raw_config = delivery.channel_config_json
+            bound_generation = delivery.channel_config_generation
+        else:
+            # Legacy mode: a delivery follows the channel's live configuration.
+            target = channel.target
+            raw_config = channel.config_json
+            bound_generation = channel.config_generation
         try:
-            config = json.loads(channel.config_json or "{}")
+            config = json.loads(raw_config or "{}")
         except (TypeError, ValueError):
             config = {}
         try:
@@ -452,10 +608,12 @@ def _claim_delivery(delivery_id: int) -> Dict[str, Any] | None:
         return {
             "delivery_id": delivery.id,
             "channel_id": channel.id,
-            "target": channel.target,
+            "target": target,
             "config": config,
             "context": context,
             "attempts": delivery.attempts,
+            "claim_token": token,
+            "config_generation": bound_generation,
         }
 
 
@@ -486,9 +644,15 @@ class DeliverySource:
             select(NotificationDelivery.id, NotificationDelivery.channel_id)
             .where(
                 or_(
-                    (NotificationDelivery.status == NotificationDeliveryStatus.PENDING)
+                    (
+                        col(NotificationDelivery.status)
+                        == NotificationDeliveryStatus.PENDING
+                    )
                     & (NotificationDelivery.next_retry_at <= now),
-                    (NotificationDelivery.status == NotificationDeliveryStatus.SENDING)
+                    (
+                        col(NotificationDelivery.status)
+                        == NotificationDeliveryStatus.SENDING
+                    )
                     & (NotificationDelivery.updated_at < stuck_cutoff),
                 )
             )
@@ -521,14 +685,30 @@ def _deliver_step(ctx) -> None:
 
 
 def _cancel_delivery(session: Session, subject: str) -> None:
-    delivery = session.get(NotificationDelivery, int(subject.rsplit("/", 1)[1]))
-    if delivery is not None and delivery.status in {
-        NotificationDeliveryStatus.PENDING,
-        NotificationDeliveryStatus.SENDING,
-    }:
-        delivery.status = NotificationDeliveryStatus.FAILED
-        delivery.last_error = "cancelled"
-        session.add(delivery)
+    # Bulk conditional cancellation: a single SQL write also clears the claim
+    # fence, so a session holding a stale row object cannot leave the token
+    # behind (which would let an in-flight attempt's late result overwrite the
+    # cancellation). The caller owns the transaction/commit.
+    affected(
+        session,
+        update(NotificationDelivery)
+        .where(
+            col(NotificationDelivery.id) == int(subject.rsplit("/", 1)[1]),
+            col(NotificationDelivery.status).in_(
+                [
+                    NotificationDeliveryStatus.PENDING,
+                    NotificationDeliveryStatus.SENDING,
+                ]
+            ),
+        )
+        .values(
+            status=NotificationDeliveryStatus.FAILED,
+            last_error="cancelled",
+            claim_token=None,
+            updated_at=utcnow(),
+        )
+        .execution_options(synchronize_session=False),
+    )
 
 
 def _channel_partition(subject: str) -> str:
@@ -645,6 +825,7 @@ def serialize_channel(
             channel.last_delivered_at.isoformat() if channel.last_delivered_at else None
         ),
         "consecutive_failures": channel.consecutive_failures,
+        "config_generation": channel.config_generation,
     }
 
 
@@ -727,6 +908,13 @@ def create_channel(
     return channel
 
 
+def _reset_channel_health(channel: NotificationChannel) -> None:
+    """Independent health state for a fresh configuration generation."""
+    channel.consecutive_failures = 0
+    channel.last_status = None
+    channel.last_error = None
+
+
 def update_channel(
     session: Session,
     channel: NotificationChannel,
@@ -742,7 +930,14 @@ def update_channel(
 
     ``printer_ids_set`` distinguishes "clear the scope" (explicit null) from
     "leave the scope unchanged" (field omitted), which a bare ``None`` cannot.
-    Re-enabling a channel resets its failure counter so it gets a fresh chance.
+
+    A material routing/authentication change — the resulting config actually
+    differs from the stored one, so re-saving a masked secret does not count —
+    and a re-enable start a new configuration generation: in-flight deliveries
+    keep following the generation they were enqueued under, its outcomes stop
+    touching channel health, and the breaker/status state starts independent.
+    Name, subscription and printer-scope edits alone do not change where a
+    notification goes, so they do not bump the generation.
     """
     # Compute the resulting events + config and validate before persisting.
     if events is not None:
@@ -752,18 +947,22 @@ def update_channel(
             final_events = json.loads(channel.events_json or "[]")
         except (TypeError, ValueError):
             final_events = []
+    material_config_change = False
     if config is not None:
         try:
             existing = json.loads(channel.config_json or "{}")
         except (TypeError, ValueError):
             existing = {}
-        secrets = _secret_keys(channel.target)
+        secret_keys = _secret_keys(channel.target)
         merged = dict(existing)
         for key, value in config.items():
             # A blank secret means "keep what's stored"; anything else overwrites.
-            if key in secrets and (value is None or value == "" or value == "********"):
+            if key in secret_keys and (
+                value is None or value == "" or value == "********"
+            ):
                 continue
             merged[key] = value
+        material_config_change = merged != existing
     else:
         try:
             merged = json.loads(channel.config_json or "{}")
@@ -771,12 +970,10 @@ def update_channel(
             merged = {}
     validate_channel(channel.target, merged, final_events)
 
+    re_enabled = enabled is not None and enabled and not channel.enabled
     if name is not None:
         channel.name = name
     if enabled is not None:
-        # Re-enabling (manually or after auto-disable) clears the failure count.
-        if enabled and not channel.enabled:
-            channel.consecutive_failures = 0
         channel.enabled = enabled
     if events is not None:
         channel.events_json = json.dumps(final_events)
@@ -786,6 +983,9 @@ def update_channel(
         )
     if config is not None:
         channel.config_json = json.dumps(merged)
+    if material_config_change or re_enabled:
+        channel.config_generation += 1
+        _reset_channel_health(channel)
     channel.updated_at = utcnow()
     session.add(channel)
     session.commit()
@@ -794,6 +994,36 @@ def update_channel(
 
 
 def delete_channel(session: Session, channel: NotificationChannel) -> None:
+    """Delete a channel, closing its in-flight deliveries observably.
+
+    With generation protection on, pending/sending outbox rows are marked
+    ``failed`` ("channel deleted") before the parent goes away, so the
+    dispatcher never retries them and the cancellation is visible in the
+    delivery history. Terminal history rows stay (their ``channel_id`` is set
+    NULL by the database) as a record of what was sent.
+    """
+    if notifications_generation_protection_enabled(session):
+        affected(
+            session,
+            update(NotificationDelivery)
+            .where(
+                col(NotificationDelivery.channel_id) == channel.id,
+                col(NotificationDelivery.status).in_(
+                    [
+                        NotificationDeliveryStatus.PENDING,
+                        NotificationDeliveryStatus.SENDING,
+                    ]
+                ),
+            )
+            .values(
+                status=NotificationDeliveryStatus.FAILED,
+                last_error=_ERROR_CHANNEL_DELETED,
+                claim_token=None,
+                updated_at=utcnow(),
+            )
+            .execution_options(synchronize_session=False),
+        )
+        session.flush()
     session.delete(channel)
     session.commit()
 
@@ -829,6 +1059,7 @@ def list_recent_deliveries(
                 "status": d.status.value,
                 "attempts": d.attempts,
                 "last_error": d.last_error,
+                "config_generation": d.channel_config_generation,
                 "created_at": d.created_at.isoformat() if d.created_at else None,
                 "delivered_at": d.delivered_at.isoformat() if d.delivered_at else None,
             }
@@ -996,6 +1227,7 @@ def enqueue_storage_event(
             channel_id=channel.id,
             event_type=event_type,
             context_json=json.dumps(context),
+            **_generation_binding(channel),
         )
         for channel in matching
     ]
