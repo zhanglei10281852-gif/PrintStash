@@ -116,6 +116,18 @@ Remote discovery is intentionally conservative:
   pauses without that penalty
 - cursors and observed keys are durable, so a restart resumes the epoch
 - absence is applied only after a complete epoch
+- every scan binds the connection identity, its credential/config revision and
+  the credential-free target destination it started with, and rechecks them at
+  each page, each observation commit and the final removal convergence
+- disabling a connection, rotating its credentials, or rejecting them (401/403)
+  mid-scan stops the run with an explicit status; no further file, cursor or
+  deletion is published, the checkpoint stays recoverable, and the current
+  index is never deleted. The next scan rebinds and resumes when the target is
+  the same; when the target itself changed, it rebuilds the epoch from scratch
+  and never applies the old target's absence against indexed files
+- reads of linked Artifacts verify the connection still serves the destination
+  the scan confirmed for that row; a different target fails closed instead of
+  serving foreign bytes
 - an empty source or a removal set larger than the safety threshold is reported
   as `remote_mass_removal_blocked` and changes no catalog rows
 - a changed size, modification time, ETag or version triggers revalidation on
@@ -251,11 +263,16 @@ files:
    verification age in a test environment or wait for the seven-day sweep.
 4. Interrupt the network during a multi-page scan. Confirm no unseen catalog
    rows are moved to trash and that the cursor resumes later.
-5. Present an empty or wrong mount. Confirm the scan fails without catalog
+5. Disable the connection, then rotate its credentials to the same target,
+   during a multi-page scan. Confirm the scan stops with an explicit status,
+   the next scan resumes the epoch to completion, and no catalog row is lost.
+   Point the connection at a different target and confirm the index from the
+   old target survives and reads of those rows fail closed.
+6. Present an empty or wrong mount. Confirm the scan fails without catalog
    removals.
-6. Trash a linked Artifact while leaving source bytes in place. Confirm the
+7. Trash a linked Artifact while leaving source bytes in place. Confirm the
    next scan does not re-import it; restore and confirm discovery resumes.
-7. Confirm the source bytes and their external backup are unchanged after Trash
+8. Confirm the source bytes and their external backup are unchanged after Trash
    and GC operations.
 
 Record the appliance model, OS/firmware, filesystem, protocol, auth mode and

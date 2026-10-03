@@ -35,6 +35,19 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
   will be removed in 0.16.
 
 ### Fixed
+- Remote Library scans now bind the storage connection generation they start
+  with. Each page, observation commit and the final removal convergence
+  revalidate that the connection is still enabled, that its credential/config
+  revision is unchanged, and (at page and convergence boundaries) that the
+  resolved target destination still matches. Disabling or rotating the
+  connection mid-scan stops the run before any further file, cursor or deletion
+  is published; the recoverable checkpoint and the current index are preserved.
+  Same-target credential rotation rebinds the checkpoint and resumes the epoch;
+  a changed target rebuilds the epoch from a safe boundary without applying
+  absence from the foreign namespace. Provider-rejected credentials (401/403)
+  become an explicit `remote_scan_credentials_rejected` state. Reads of linked
+  Artifacts now fail closed if the connection no longer serves the target their
+  scan confirmed, instead of streaming foreign bytes.
 - Containers start with read-only Library source mounts beneath `/data`. Startup
   ownership repair is limited to app-owned directories and preserves external
   sources, including bind mounts on the same filesystem (#330).

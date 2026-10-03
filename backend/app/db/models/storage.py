@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     Index,
+    String,
     Text,
     UniqueConstraint,
     text,
@@ -223,6 +224,19 @@ class StorageConnection(SQLModel, table=True):
         default="{}", sa_column=Column(EncryptedText(), nullable=False)
     )
     enabled: bool = Field(default=True, index=True)
+    # Verifiable generation of the profile's effective credentials and
+    # configuration. Bumped on every effective secret/config change, so a
+    # running remote scan can prove the database generation still matches the
+    # connection it bound at start. The literal backfill only ever marks rows
+    # created before revisions existed; the ORM always mints a fresh value.
+    revision: str = Field(
+        default_factory=lambda: secrets.token_hex(16),
+        sa_column=Column(
+            String(64),
+            nullable=False,
+            server_default="7f3a9c1e5b8d4062a6f0d2c9e1b47853",
+        ),
+    )
     manual_backup_enabled: bool = Field(
         default=True,
         sa_column=Column(Boolean, nullable=False, server_default="1"),

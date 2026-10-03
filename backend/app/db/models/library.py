@@ -150,6 +150,12 @@ class File(SQLModel, table=True):
     source_version_id: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    # Credential-free destination identity (provider_ref) the scan confirmed
+    # when this row was indexed. Later reads fail closed if the connection now
+    # points elsewhere, so a rotated or replaced connection can never serve
+    # foreign bytes for a row indexed against another target. NULL for rows
+    # indexed before the column existed; reads admit them until a scan stamps.
+    source_target_ref: Optional[str] = Field(default=None, max_length=64, index=True)
     # Last time discovery read and hashed the source bytes. Metadata-only scans
     # remain cheap, while a rotating weekly sweep still catches content changes
     # on appliances that preserve both size and mtime.

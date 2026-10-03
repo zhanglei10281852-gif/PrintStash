@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from typing import Mapping
 
 from app.db.models import LibrarySourceKind, StorageConnection
@@ -19,6 +20,11 @@ from app.modules.storage.storage_providers import (
 
 class StorageConnectionConfigError(ValueError):
     """A connection row or submitted configuration is invalid."""
+
+
+def new_connection_revision() -> str:
+    """Mint the verifiable generation stamped after an effective profile change."""
+    return secrets.token_hex(16)
 
 
 def _json_object(value: str) -> dict[str, object]:

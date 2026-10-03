@@ -30,6 +30,7 @@ from app.modules.storage.storage_backend.contracts import StorageConfigurationEr
 from app.modules.storage.storage_connections import (
     StorageConnectionConfigError,
     connection_target_signature,
+    new_connection_revision,
     serialize_connection_config,
 )
 from app.modules.storage.storage_operations import (
@@ -260,8 +261,15 @@ def update_connection(
             raise HTTPException(
                 status_code=409, detail="storage_connection_target_in_use"
             )
-        row.config_json = json.dumps(configuration, sort_keys=True)
-        row.secret_json = json.dumps(secrets, sort_keys=True)
+        new_config_json = json.dumps(configuration, sort_keys=True)
+        new_secret_json = json.dumps(secrets, sort_keys=True)
+        if new_config_json != row.config_json or new_secret_json != row.secret_json:
+            # Rotate the verifiable generation so in-flight scans bound to the
+            # old credentials/configuration stop at their next check. Same
+            # target, new credentials: dependent scans rebind and resume.
+            row.revision = new_connection_revision()
+        row.config_json = new_config_json
+        row.secret_json = new_secret_json
     if body.purpose is not None and body.purpose != row.purpose:
         _assert_removed_uses_are_free(row, body.purpose, session)
         row.purpose = body.purpose

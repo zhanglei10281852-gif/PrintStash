@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterator
+
+from sqlmodel import Session, select
 
 from app.db.models import (
     ExternalLibrary,
@@ -25,6 +29,7 @@ from app.modules.storage.storage_connections import (
     StorageConnectionConfigError,
     load_connection_config,
 )
+from app.modules.storage.storage_ownership import provider_ref_for_backend
 from app.modules.storage.storage_providers import resolve_transport
 
 from .contracts import (
@@ -34,6 +39,66 @@ from .contracts import (
     SourceEntry,
     SourcePage,
 )
+
+# Failures at the connection seam (row missing/disabled, purpose withdrawn,
+# generation rotated) that a scan treats as binding failures rather than
+# transient provider failures.
+BINDING_FAILURE_CODES = frozenset(
+    {
+        "storage_connection_disabled",
+        "storage_connection_missing",
+        "storage_connection_not_library",
+        "storage_connection_kind_invalid",
+        "storage_connection_invalid",
+    }
+)
+
+# Provider status text that proves the configured credentials were rejected.
+# Matched across the whole exception chain because adapters deliberately
+# surface only a generic message and keep the response in the chained cause.
+_CREDENTIAL_REJECTION_MARKERS = re.compile(
+    r"(?:"
+    r"(?<![0-9])40[13](?![0-9])"  # an HTTP 401/403 status standing alone
+    r"|forbidden"
+    r"|unauthorized"
+    r"|access denied"
+    r"|permission denied"
+    r"|authentication failed"
+    r")",
+    re.IGNORECASE,
+)
+
+
+class ConnectionBindingError(LibrarySourceError):
+    """A scan's bound connection generation no longer matches the database."""
+
+
+@dataclass(frozen=True)
+class RemoteScanBinding:
+    """The connection generation one scan is allowed to observe through."""
+
+    connection_id: int
+    revision: str
+    target_ref: str
+
+
+def credentials_rejected_reason(exc: BaseException) -> str | None:
+    """Classify a provider failure as a credential rejection, if proven so.
+
+    Walks the cause/context chain looking for an HTTP/auth status marker. The
+    generic adapter messages never match, so a timeout or reset keeps its
+    ordinary failure handling while a 401/403 becomes an explicit, recoverable
+    scan state. Provider text is never returned, so response details cannot leak
+    into the recorded reason.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _CREDENTIAL_REJECTION_MARKERS.search(str(current)):
+            return "remote_scan_credentials_rejected"
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _require_observation(expected: SourceEntry | None, actual: SourceEntry) -> None:
@@ -191,6 +256,97 @@ def source_for_library(library: ExternalLibrary) -> LibrarySource:
         return source_from_connection(connection, scan_limits=True)
 
 
+def target_ref_for_source(source: LibrarySource) -> str:
+    """Credential-free destination identity behind a resolved source."""
+    backend = getattr(source, "backend", None)
+    if backend is None:
+        raise LibrarySourceError("storage_connection_invalid")
+    return provider_ref_for_backend(backend)
+
+
+def binding_for(
+    session: Session, library: ExternalLibrary, source: LibrarySource
+) -> RemoteScanBinding | None:
+    """Bind the resolved source to the connection row the scan transaction sees.
+
+    Returns None only when the library has no persisted connection and the
+    source was supplied through a replaced ``source_for_library`` seam (the
+    mounted-source guard and test doubles); production remote libraries always
+    have a connection and therefore a binding.
+    """
+    if library.connection_id is None:
+        return None
+    connection = session.get(StorageConnection, library.connection_id)
+    if connection is None:
+        raise ConnectionBindingError("storage_connection_missing")
+    if not connection.enabled:
+        raise ConnectionBindingError("storage_connection_disabled")
+    if not connection.purpose.allows(StorageConnectionPurpose.LIBRARY):
+        raise ConnectionBindingError("storage_connection_not_library")
+    if connection.id is None:
+        raise ConnectionBindingError("storage_connection_missing")
+    return RemoteScanBinding(
+        connection_id=connection.id,
+        revision=connection.revision,
+        target_ref=target_ref_for_source(source),
+    )
+
+
+def assert_binding_current(
+    session: Session,
+    binding: RemoteScanBinding,
+    *,
+    verify_target: bool = False,
+) -> None:
+    """Fail closed unless *binding* still matches the current connection row.
+
+    The cheap revision/enabled/purpose check runs at every page and observation
+    commit. ``verify_target`` additionally rebuilds the resolved destination and
+    compares its credential-free identity, catching an out-of-band configuration
+    change that did not bump the revision; it runs at page and convergence
+    boundaries.
+    """
+    row = session.execute(
+        select(
+            StorageConnection.enabled,
+            StorageConnection.revision,
+            StorageConnection.purpose,
+        ).where(StorageConnection.id == binding.connection_id)
+    ).first()
+    if row is None:
+        raise ConnectionBindingError("storage_connection_missing")
+    enabled, revision, purpose = row
+    if not enabled:
+        raise ConnectionBindingError("storage_connection_disabled")
+    if not purpose.allows(StorageConnectionPurpose.LIBRARY):
+        raise ConnectionBindingError("storage_connection_not_library")
+    if revision != binding.revision:
+        raise ConnectionBindingError("storage_connection_revision_changed")
+    if verify_target:
+        # Resolve through a transient profile so this read never dirties (and
+        # re-encrypts) the persisted row on every boundary check.
+        profile_row = session.execute(
+            select(
+                StorageConnection.kind,
+                StorageConnection.config_json,
+                StorageConnection.secret_json,
+            ).where(StorageConnection.id == binding.connection_id)
+        ).first()
+        if profile_row is None:
+            raise ConnectionBindingError("storage_connection_missing")
+        profile = StorageConnection(
+            id=binding.connection_id,
+            name="",
+            kind=profile_row.kind,
+            config_json=str(profile_row.config_json),
+            secret_json=str(profile_row.secret_json),
+            enabled=True,
+        )
+        source = source_from_connection(profile, scan_limits=True)
+        if target_ref_for_source(source) != binding.target_ref:
+            raise ConnectionBindingError("storage_connection_target_changed")
+
+
 def source_for_file(file: File) -> tuple[LibrarySource, str]:
     if file.external_library_id is None or not file.source_key:
         raise LibrarySourceError("remote_file_source_missing")
@@ -207,7 +363,16 @@ def source_for_file(file: File) -> tuple[LibrarySource, str]:
             raise LibrarySourceError("storage_connection_missing")
         connection.config_json = str(connection.config_json)
         connection.secret_json = str(connection.secret_json)
-        return source_from_connection(connection), file.source_key
+        source = source_from_connection(connection)
+        if (
+            file.source_target_ref is not None
+            and target_ref_for_source(source) != file.source_target_ref
+        ):
+            # The current connection serves a different destination than the
+            # one the scan confirmed for this row. Refuse before any byte is
+            # fetched; the row stays recoverable if the target is restored.
+            raise LibrarySourceError("remote_file_source_target_changed")
+        return source, file.source_key
 
 
 def timestamp(value: datetime | None) -> float | None:

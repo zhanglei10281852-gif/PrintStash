@@ -1,17 +1,15 @@
 """Retiring grouping tables leaves independent printable library records intact."""
 
+from types import SimpleNamespace
+
 from sqlalchemy import create_engine, inspect, text
 from sqlmodel import Session, select
 
 from alembic import command
 from app.db.migrate import _alembic_config
-from app.db.models import File, FileType, Model, MultipartModel, PrintJob
-from tests.factories import (
-    build_file,
-    build_model,
-    build_multipart_model,
-    build_print_job,
-)
+from app.db.models import FileType, Model, MultipartModel, PrintJob
+from tests.factories import build_model, build_multipart_model, build_print_job
+from tests.factories.migration_rows import seed_schema_row
 
 PREVIOUS = "6f27f2e6090a"
 REMOVAL = "0b36c56fb17d"
@@ -26,14 +24,25 @@ class TestRemoveModelFamiliesMigration:
         try:
             with Session(engine) as session:
                 model = build_model(session, "Original", hash="a" * 64)
-                revision = build_file(
-                    session,
-                    model,
-                    file_type=FileType.GCODE,
-                    filename="original.gcode",
+                session.commit()
+                # Seed the file against the historical schema: the current ORM
+                # mapper emits columns introduced by later migrations.
+                seed_schema_row(
+                    session.connection(),
+                    "files",
+                    model_id=model.id,
                     path="/library/original.gcode",
+                    original_filename="original.gcode",
+                    file_type=FileType.GCODE.value,
                     size_bytes=3,
                     sha256="b" * 64,
+                )
+                file_id = session.execute(
+                    text("SELECT id FROM files WHERE model_id = :model_id"),
+                    {"model_id": model.id},
+                ).scalar_one()
+                revision = SimpleNamespace(
+                    id=file_id, model_id=model.id, original_filename="original.gcode"
                 )
                 job = build_print_job(session, revision)
                 multipart = build_multipart_model(session, "Printed kit")
@@ -75,9 +84,18 @@ class TestRemoveModelFamiliesMigration:
                     "model_family_stars",
                 }
             )
+            with engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        text(
+                            "SELECT original_filename FROM files WHERE id = :file_id"
+                        ),
+                        {"file_id": file_id},
+                    ).scalar_one()
+                    == "original.gcode"
+                )
             with Session(engine) as session:
                 assert session.get(Model, model_id).name == "Original"
-                assert session.get(File, file_id).original_filename == "original.gcode"
                 assert session.get(PrintJob, job_id).model_id == model_id
                 assert session.get(MultipartModel, multipart_id).name == "Printed kit"
                 assert session.exec(select(Model.id)).all() == [model_id]

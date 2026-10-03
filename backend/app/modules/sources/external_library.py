@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Optional
+from typing import Callable, Optional
 
 from croniter import croniter
 from printstash_core.files import slugify
@@ -57,9 +57,15 @@ from app.modules.ingestion.ingestion import (
 )
 from app.modules.library import taxonomy
 from app.modules.sources.library_source import (
+    ConnectionBindingError,
     LibrarySource,
     LibrarySourceError,
+    RemoteScanBinding,
     SourceEntry,
+    BINDING_FAILURE_CODES,
+    assert_binding_current,
+    binding_for,
+    credentials_rejected_reason,
     source_for_library,
 )
 from app.modules.sources.library_source import (
@@ -600,12 +606,20 @@ def _index_remote_file(
     library: ExternalLibrary,
     source: LibrarySource,
     entry: SourceEntry,
+    *,
+    target_ref: str | None,
+    gate: Callable[[], None] | None = None,
 ) -> File:
     source_name = Path(entry.key)
     file_type = SUFFIX_TO_FILE_TYPE[source_name.suffix.lower()]
     with source.materialize(entry.key, expected=entry) as content:
         read_path = content.path
         blob_hash = sha256_file(read_path)
+        # Bytes came from the bound source; the connection generation can still
+        # rotate while the download is in flight. Recheck before publishing any
+        # catalog row so this observation never lands under a stale binding.
+        if gate is not None:
+            gate()
         model, created = resolve_or_create_model(
             session,
             dedup_hash=blob_hash,
@@ -639,6 +653,7 @@ def _index_remote_file(
         row.source_key = entry.key
         row.source_etag = content.entry.etag
         row.source_version_id = content.entry.version_id
+        row.source_target_ref = target_ref
         row.source_verified_at = utcnow()
         session.add(row)
         session.commit()
@@ -650,9 +665,14 @@ def _reindex_remote_file(
     file_row: File,
     source: LibrarySource,
     entry: SourceEntry,
+    *,
+    target_ref: str | None,
+    gate: Callable[[], None] | None = None,
 ) -> bool:
     with source.materialize(entry.key, expected=entry) as content:
         read_path = content.path
+        if gate is not None:
+            gate()
         display_path = Path(file_row.path)
         current = dict(_PINNED_READ_PATHS.get() or {})
         current[str(display_path)] = read_path
@@ -667,6 +687,8 @@ def _reindex_remote_file(
             )
             file_row.source_etag = content.entry.etag
             file_row.source_version_id = content.entry.version_id
+            if target_ref is not None:
+                file_row.source_target_ref = target_ref
             session.add(file_row)
             session.commit()
             return changed
@@ -718,13 +740,155 @@ def _remote_checkpoint(
     ):
         if checkpoint is not None:
             session.delete(checkpoint)
-            session.flush()
-        checkpoint = ExternalLibraryCheckpoint(
-            library_id=int(library.id), epoch=uuid.uuid4().hex
-        )
-        session.add(checkpoint)
-        session.flush()
+            session.commit()
+        checkpoint = _new_remote_checkpoint(session, library, None)
+        session.commit()
+        session.refresh(checkpoint)
     return checkpoint
+
+
+def _new_remote_checkpoint(
+    session: Session,
+    library: ExternalLibrary,
+    binding: RemoteScanBinding | None,
+) -> ExternalLibraryCheckpoint:
+    checkpoint = ExternalLibraryCheckpoint(
+        library_id=int(library.id),
+        epoch=uuid.uuid4().hex,
+        connection_id=binding.connection_id if binding is not None else None,
+        connection_revision=binding.revision if binding is not None else None,
+        connection_target_ref=binding.target_ref if binding is not None else None,
+    )
+    session.add(checkpoint)
+    session.flush()
+    return checkpoint
+
+
+def _reset_remote_checkpoint(
+    session: Session,
+    library: ExternalLibrary,
+    binding: RemoteScanBinding | None,
+) -> ExternalLibraryCheckpoint:
+    """Discard an epoch bound to another generation and start at the boundary.
+
+    Only scan evidence is discarded: the checkpoint, its observations and the
+    resumed cursor. Catalog File rows are never touched, so absence is never
+    inferred from a foreign target; the next scan enumerates from scratch.
+    """
+    existing = session.exec(
+        select(ExternalLibraryCheckpoint).where(
+            ExternalLibraryCheckpoint.library_id == library.id
+        )
+    ).first()
+    if existing is not None:
+        session.delete(existing)
+        session.commit()
+    checkpoint = _new_remote_checkpoint(session, library, binding)
+    session.commit()
+    session.refresh(checkpoint)
+    return checkpoint
+
+
+def _reconcile_checkpoint_binding(
+    session: Session,
+    checkpoint: ExternalLibraryCheckpoint,
+    library: ExternalLibrary,
+    binding: RemoteScanBinding | None,
+) -> ExternalLibraryCheckpoint:
+    """Re-establish the epoch at its safe boundary for the current generation.
+
+    Same-target credential rotation adopts the new revision and keeps the
+    cursor and observed keys. A different connection identity or target
+    rebuilds the epoch. A pre-upgrade checkpoint (no binding) binds in place;
+    its inventory cursor already pins the target and prefix.
+    """
+    if binding is None:
+        return checkpoint
+    if checkpoint.connection_id is None:
+        checkpoint.connection_id = binding.connection_id
+        checkpoint.connection_revision = binding.revision
+        checkpoint.connection_target_ref = binding.target_ref
+        checkpoint.updated_at = utcnow()
+        session.add(checkpoint)
+        session.commit()
+        return checkpoint
+    if (
+        checkpoint.connection_id != binding.connection_id
+        or checkpoint.connection_target_ref != binding.target_ref
+    ):
+        return _reset_remote_checkpoint(session, library, binding)
+    if checkpoint.connection_revision != binding.revision:
+        checkpoint.connection_revision = binding.revision
+        # The old credentials' failure backoff belongs to the retired
+        # generation; the new one starts probing immediately.
+        checkpoint.backoff_until = None
+        checkpoint.updated_at = utcnow()
+        session.add(checkpoint)
+        session.commit()
+    return checkpoint
+
+
+def _bind_remote_scan(
+    session: Session, library: ExternalLibrary
+) -> tuple[LibrarySource, RemoteScanBinding | None]:
+    try:
+        source = source_for_library(library)
+    except LibrarySourceError as exc:
+        if str(exc) in BINDING_FAILURE_CODES:
+            raise ConnectionBindingError(str(exc)) from exc
+        raise
+    return source, binding_for(session, library, source)
+
+
+def _binding_gate(
+    session: Session, binding: RemoteScanBinding | None, *, verify_target: bool = False
+) -> None:
+    if binding is not None:
+        assert_binding_current(session, binding, verify_target=verify_target)
+
+
+def _finish_binding_failure(
+    session: Session,
+    library: ExternalLibrary,
+    summary: ScanSummary,
+    *,
+    job_id: str | None,
+    code: str,
+) -> dict:
+    """Land a binding failure without publishing any stale-generation evidence.
+
+    A same-target rotation is a recoverable partial state with no backoff; a
+    foreign target discards only the scan epoch; a disabled/missing/invalid
+    connection waits 24 hours for an administrator. Catalog rows are untouched.
+    """
+    target_rebuilt = code == "storage_connection_target_changed"
+    rotation = code == "storage_connection_revision_changed"
+    if target_rebuilt:
+        session.delete(_remote_checkpoint(session, library))
+        session.commit()
+    else:
+        bound_checkpoint = _remote_checkpoint(session, library)
+        bound_checkpoint.updated_at = utcnow()
+        if rotation:
+            bound_checkpoint.backoff_until = None
+        else:
+            bound_checkpoint.backoff_until = utcnow() + timedelta(hours=24)
+        session.add(bound_checkpoint)
+    summary.error = code
+    summary.aborted = True
+    library.last_scanned_at = utcnow()
+    library.last_scan_status = (
+        ExternalLibraryScanStatus.PARTIAL
+        if rotation
+        else ExternalLibraryScanStatus.ERROR
+    )
+    library.last_scan_summary = json.dumps(summary.as_dict())
+    library.updated_at = utcnow()
+    session.add(library)
+    session.commit()
+    if job_id:
+        registry.finish(job_id, JobOutcome.FAILED, error=code)
+    return summary.as_dict()
 
 
 def scan_remote_library(
@@ -752,26 +916,41 @@ def scan_remote_library(
             if library.source_kind == LibrarySourceKind.MOUNTED:
                 raise ValueError("library_source_is_mounted")
             checkpoint = _remote_checkpoint(session, library)
-            if (
-                checkpoint.backoff_until
-                and ensure_utc(checkpoint.backoff_until) > utcnow()
-            ):
-                return {
-                    **summary.as_dict(),
-                    "backoff_until": checkpoint.backoff_until.isoformat(),
-                }
-            source = source_for_library(library)
-            library.last_scan_status = ExternalLibraryScanStatus.RUNNING
-            session.add(library)
-            session.commit()
             try:
+                source, binding = _bind_remote_scan(session, library)
+                checkpoint = _reconcile_checkpoint_binding(
+                    session, checkpoint, library, binding
+                )
+                if (
+                    checkpoint.backoff_until
+                    and ensure_utc(checkpoint.backoff_until) > utcnow()
+                ):
+                    # A same-generation provider failure is still cooling down.
+                    # Reconciliation clears the backoff when the generation
+                    # moved, so credential rotation never waits the old penalty.
+                    return {
+                        **summary.as_dict(),
+                        "backoff_until": checkpoint.backoff_until.isoformat(),
+                    }
+                target_ref = binding.target_ref if binding is not None else None
+
+                def gate() -> None:
+                    _binding_gate(session, binding)
+
+                library.last_scan_status = ExternalLibraryScanStatus.RUNNING
+                session.add(library)
+                session.commit()
                 if monotonic() - scan_started >= _REMOTE_SLICE_MAX_SECONDS:
                     raise LibrarySourceError("remote_scan_slice_deadline")
+                _binding_gate(session, binding)
                 page = source.list_page(
                     library.source_prefix,
                     cursor=checkpoint.cursor,
                     limit=_REMOTE_PAGE_LIMIT,
                 )
+                # The page was fetched through the bound backend; confirm the
+                # generation still matches before any observation is accepted.
+                _binding_gate(session, binding, verify_target=True)
                 selected: list[SourceEntry] = []
                 bytes_in_slice = 0
                 consumed = 0
@@ -827,20 +1006,44 @@ def scan_remote_library(
                     # cannot turn one scheduled scan into an unbounded network job.
                     if monotonic() - scan_started >= _REMOTE_SLICE_MAX_SECONDS:
                         raise LibrarySourceError("remote_scan_slice_deadline")
+                    _binding_gate(session, binding)
                     existing = by_key.get(entry.key)
                     if entry.key in tombstones:
                         summary.skipped += 1
                     elif existing is None:
-                        existing = _index_remote_file(session, library, source, entry)
+                        existing = _index_remote_file(
+                            session,
+                            library,
+                            source,
+                            entry,
+                            target_ref=target_ref,
+                            gate=gate,
+                        )
                         summary.added += 1
                     elif _remote_markers_unchanged(
                         existing, entry
                     ) and not _source_hash_due(existing, observation_time):
+                        if target_ref is not None and existing.source_target_ref is None:
+                            # Backfill the read-consistency guard on rows indexed
+                            # before it existed, without forcing a re-download.
+                            existing.source_target_ref = target_ref
+                            session.add(existing)
                         summary.skipped += 1
-                    elif _reindex_remote_file(session, existing, source, entry):
+                    elif _reindex_remote_file(
+                        session,
+                        existing,
+                        source,
+                        entry,
+                        target_ref=target_ref,
+                        gate=gate,
+                    ):
                         summary.updated += 1
                     else:
                         summary.skipped += 1
+                    # The observation and its cursor advance publish together;
+                    # recheck the generation so nothing is committed under a
+                    # connection disabled or rotated during this entry's work.
+                    _binding_gate(session, binding)
                     observation = session.exec(
                         select(ExternalLibraryObservation).where(
                             ExternalLibraryObservation.checkpoint_id == checkpoint.id,
@@ -864,6 +1067,10 @@ def scan_remote_library(
                 checkpoint.bytes_read += bytes_in_slice
                 checkpoint.updated_at = utcnow()
                 if page.complete:
+                    # Final convergence: absence evidence is only valid for the
+                    # generation this epoch observed. Rebuild the destination
+                    # and recheck the row before any removal is applied.
+                    _binding_gate(session, binding, verify_target=True)
                     session.flush()
                     total = session.exec(
                         select(func.count())
@@ -884,7 +1091,7 @@ def scan_remote_library(
                         ExternalLibraryTombstone.source_key == File.source_key,
                         ExternalLibraryTombstone.cleared_at == None,  # noqa: E711
                     )
-                    missing = session.exec(
+                    missing_statement = (
                         select(File)
                         .where(
                             File.external_library_id == library_id,
@@ -893,7 +1100,19 @@ def scan_remote_library(
                             ~seen,
                             ~suppressed,  # noqa: E711
                         )
-                        .limit(removal_limit + 1)
+                    )
+                    if binding is not None:
+                        # This target's absence cannot retire rows a different
+                        # generation confirmed; pre-binding rows (NULL) stay
+                        # eligible and remain covered by the mass-removal guard.
+                        missing_statement = missing_statement.where(
+                            or_(
+                                File.source_target_ref.is_(None),
+                                File.source_target_ref == binding.target_ref,
+                            )
+                        )
+                    missing = session.exec(
+                        missing_statement.limit(removal_limit + 1)
                     ).all()
                     observed_count = session.exec(
                         select(func.count())
@@ -958,6 +1177,15 @@ def scan_remote_library(
                 session.add(library)
                 session.commit()
                 raise
+            except ConnectionBindingError as exc:
+                session.rollback()
+                return _finish_binding_failure(
+                    session,
+                    library,
+                    summary,
+                    job_id=job_id,
+                    code=str(exc),
+                )
             except Exception as exc:
                 session.rollback()
                 checkpoint = _remote_checkpoint(session, library)
@@ -974,7 +1202,7 @@ def scan_remote_library(
                     if deadline_reached
                     else ExternalLibraryScanStatus.ERROR
                 )
-                summary.error = failure_of(exc)
+                summary.error = credentials_rejected_reason(exc) or failure_of(exc)
                 summary.aborted = True
                 library.last_scan_summary = json.dumps(summary.as_dict())
                 session.add(checkpoint)

@@ -126,6 +126,17 @@ class ExternalLibraryCheckpoint(SQLModel, table=True):
     )
     epoch: str = Field(max_length=64, index=True)
     cursor: Optional[str] = Field(default=None, max_length=2048)
+    # The storage connection generation this epoch was established against.
+    # A resumed scan revalidates identity, enabled state, revision and the
+    # credential-free target before trusting the cursor or its observations;
+    # a same-target credential rotation rebinds, a changed target rebuilds the
+    # epoch from scratch. NULL only on checkpoints started before this column
+    # existed, which bind themselves on their first post-upgrade scan.
+    connection_id: Optional[int] = Field(
+        default=None, foreign_key="storage_connections.id", index=True
+    )
+    connection_revision: Optional[str] = Field(default=None, max_length=64)
+    connection_target_ref: Optional[str] = Field(default=None, max_length=64, index=True)
     complete: bool = Field(default=False, index=True)
     observed_keys_json: str = Field(
         default="[]", sa_column=Column(Text, nullable=False)

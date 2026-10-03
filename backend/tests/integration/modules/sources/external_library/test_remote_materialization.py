@@ -71,6 +71,7 @@ class TestIndexRemoteFile:
                 library,
                 source,
                 SourceEntry("models/sample.gcode", len(payload) + 1),
+                target_ref=None,
             )
 
         assert db_session.exec(select(Model.id)).all() == initial_model_ids

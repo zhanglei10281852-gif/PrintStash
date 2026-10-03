@@ -588,6 +588,36 @@ class TestSourceHelpers:
         assert library_source.timestamp(naive) == library_source.timestamp(aware)
 
 
+class TestScanFailureClassification:
+    @pytest.mark.parametrize(
+        "marker",
+        ["401 Unauthorized", "403 Forbidden", "Access Denied", "permission denied"],
+    )
+    def test_rejected_provider_credentials_are_recognized_through_wrappers(
+        self, marker: str
+    ) -> None:
+        cause = PermissionError(marker)
+        try:
+            raise StorageConfigurationError("remote_storage_list_failed") from cause
+        except StorageConfigurationError as exc:
+            assert (
+                library_source.credentials_rejected_reason(exc)
+                == "remote_scan_credentials_rejected"
+            )
+
+    @pytest.mark.parametrize(
+        "message",
+        ["transient reset by peer", "500 Internal Server Error", "connection timeout"],
+    )
+    def test_other_provider_failures_are_not_credential_rejections(
+        self, message: str
+    ) -> None:
+        assert library_source.credentials_rejected_reason(RuntimeError(message)) is None
+        wrapped = StorageConfigurationError("remote_storage_read_failed")
+        wrapped.__cause__ = OSError(message)
+        assert library_source.credentials_rejected_reason(wrapped) is None
+
+
 class _SessionFactory:
     def __init__(self, rows: dict[int, object]) -> None:
         self.rows = rows

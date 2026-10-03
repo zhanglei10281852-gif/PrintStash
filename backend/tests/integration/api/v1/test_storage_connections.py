@@ -771,6 +771,36 @@ class TestConnectionEditing:
         assert secrets["secret_key"] == "replacement-secret-never-returned"
         assert secrets["secret_key"] not in response.text
 
+    def test_same_target_secret_rotation_bumps_the_revision(
+        self, client, db_session, editable
+    ):
+        identifier, headers = editable
+        before = db_session.get(StorageConnection, identifier).revision
+        response = client.patch(
+            f"/api/v1/storage-connections/{identifier}",
+            headers=headers,
+            json={"secrets": {"secret_key": "rotated-secret-never-returned"}},
+        )
+        assert response.status_code == 200, response.text
+        db_session.expire_all()
+        after = db_session.get(StorageConnection, identifier)
+        assert after.revision
+        assert after.revision != before
+
+    def test_name_only_edit_keeps_the_connection_revision(
+        self, client, db_session, editable
+    ):
+        identifier, headers = editable
+        before = db_session.get(StorageConnection, identifier).revision
+        response = client.patch(
+            f"/api/v1/storage-connections/{identifier}",
+            headers=headers,
+            json={"name": "Renamed offsite"},
+        )
+        assert response.status_code == 200, response.text
+        db_session.expire_all()
+        assert db_session.get(StorageConnection, identifier).revision == before
+
     def test_linked_source_blocks_target_edits(self, client, db_session, editable):
         import json
 
