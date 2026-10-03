@@ -4,7 +4,11 @@ import pytest
 
 import app.modules.sources.root_binding as source_root_binding
 from app.core.config import _overlay
-from app.modules.sources.external_library import _ScanProgressCoalescer
+from app.modules.sources.external_library import (
+    LibrarySourceError,
+    _ScanProgressCoalescer,
+    normalize_remote_scan_path,
+)
 
 
 class TestScanProgressCoalescer:
@@ -32,6 +36,39 @@ class TestScanProgressCoalescer:
 
         assert progress.should_flush(3, now=10.0) is True
         assert progress.last_percent == 100
+
+
+class TestNormalizeRemoteScanPath:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, None),
+            ("", None),
+            ("   ", None),
+            ("/", None),
+            ("functional", "functional"),
+            ("functional/", "functional"),
+            ("/functional/", "functional"),
+            ("a/b/", "a/b"),
+            ("nested/functional", "nested/functional"),
+        ],
+    )
+    def test_canonicalizes_subdirectories_under_the_source_prefix(
+        self, value: str | None, expected: str | None
+    ) -> None:
+        assert normalize_remote_scan_path(value) == expected
+
+    @pytest.mark.parametrize("value", ["../outside", "a/../../etc", ".."])
+    def test_rejects_a_path_escaping_the_source_prefix(self, value: str) -> None:
+        with pytest.raises(LibrarySourceError, match="path_outside_library_root"):
+            normalize_remote_scan_path(value)
+
+    @pytest.mark.parametrize("value", ["a//b", "a/./b", "a\\b", "a/b\\c"])
+    def test_rejects_a_shape_that_is_not_a_remote_directory(
+        self, value: str
+    ) -> None:
+        with pytest.raises(LibrarySourceError, match="remote_scan_path_invalid"):
+            normalize_remote_scan_path(value)
 
 
 class TestInstallationIdentity:

@@ -113,17 +113,30 @@ class ExternalLibraryTombstone(SQLModel, table=True):
 
 
 class ExternalLibraryCheckpoint(SQLModel, table=True):
-    """Restart-safe cursor and complete-epoch evidence for bounded scans."""
+    """Restart-safe cursor and complete-epoch evidence for bounded scans.
+
+    One row per (library, scanned prefix): a subdirectory scan keeps its own
+    epoch, cursor, and observations independently of the whole-library
+    ``source_prefix`` epoch, so an interrupted prefix run resumes the same
+    prefix and its completion can only judge absence inside it.
+    """
 
     __tablename__ = "external_library_checkpoints"
     __table_args__ = (
-        UniqueConstraint("library_id", name="uq_external_library_checkpoint"),
+        UniqueConstraint(
+            "library_id",
+            "scan_prefix",
+            name="uq_external_library_checkpoint_prefix",
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     library_id: int = Field(
         foreign_key="external_libraries.id", index=True, ondelete="CASCADE"
     )
+    # Connection-relative prefix this epoch enumerates. "" / source_prefix is
+    # the whole-library scan; anything narrower is a subdirectory scan.
+    scan_prefix: str = Field(default="", sa_column=Column(Text, nullable=False))
     epoch: str = Field(max_length=64, index=True)
     cursor: Optional[str] = Field(default=None, max_length=2048)
     complete: bool = Field(default=False, index=True)

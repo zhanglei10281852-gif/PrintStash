@@ -40,6 +40,7 @@ from app.db.models import (
     ExternalLibraryCheckpoint,
     ExternalLibraryCollectionMode,
     ExternalLibraryObservation,
+    ExternalLibraryScanScope,
     ExternalLibraryScanStatus,
     ExternalLibraryTombstone,
     ExternalLibraryWatchMode,
@@ -702,12 +703,115 @@ def _remote_markers_unchanged(file_row: File, entry: SourceEntry) -> bool:
     return usable
 
 
+def normalize_remote_scan_path(value: str | None) -> str | None:
+    """Canonicalize an admin-supplied subdirectory under ``source_prefix``.
+
+    Returns ``None`` for an empty/root selection, which means the library's
+    whole ``source_prefix``. A ``..`` segment would escape the configured
+    source root; empty/``.`` segments and Windows separators are not valid
+    remote directory names. Both raise instead of being silently reshaped.
+    """
+    if value is None:
+        return None
+    stripped = value.strip().strip("/")
+    if not stripped:
+        return None
+    parts = stripped.split("/")
+    if any(part == ".." for part in parts):
+        raise LibrarySourceError("path_outside_library_root")
+    if any(not part or part == "." or "\\" in part for part in parts):
+        raise LibrarySourceError("remote_scan_path_invalid")
+    return "/".join(parts)
+
+
+def _remote_base_prefix(library: ExternalLibrary) -> str:
+    return library.source_prefix.strip("/")
+
+
+def _adopt_incomplete_prefix(
+    session: Session,
+    library: ExternalLibrary,
+    base_prefix: str,
+    *,
+    now: datetime,
+) -> str | None:
+    """Pick an interrupted subdirectory epoch a full-scope run should finish.
+
+    A scheduled scan, a job-engine resubmit, or a process restart arrives with
+    no requested path. An interrupted prefix scan must keep draining its own
+    prefix rather than being mistaken for a fresh whole-library snapshot, so
+    the newest unbacked-off incomplete prefix checkpoint is adopted first.
+    Prefixes parked in provider backoff are skipped (their failure is still
+    surfaced via that checkpoint), letting the whole-library scan proceed.
+    """
+    return session.exec(
+        select(ExternalLibraryCheckpoint.scan_prefix)
+        .where(
+            ExternalLibraryCheckpoint.library_id == library.id,
+            ExternalLibraryCheckpoint.scan_prefix != base_prefix,
+            ExternalLibraryCheckpoint.complete.is_(False),
+            or_(
+                ExternalLibraryCheckpoint.backoff_until.is_(None),
+                ExternalLibraryCheckpoint.backoff_until <= now,
+            ),
+        )
+        .order_by(col(ExternalLibraryCheckpoint.updated_at).desc())
+    ).first()
+
+
+def _resolve_scan_prefix(
+    session: Session,
+    library: ExternalLibrary,
+    relative_path: str | None,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, ExternalLibraryScanScope]:
+    """Decide the prefix this attempt enumerates and its evidence scope.
+
+    An explicit subdirectory always scans exactly that prefix (resuming its
+    epoch). An unspecified or blank path adopts an interrupted prefix epoch and
+    otherwise scans the whole configured ``source_prefix``.
+    """
+    base_prefix = _remote_base_prefix(library)
+    sub_prefix = normalize_remote_scan_path(relative_path)
+    if sub_prefix is not None:
+        scan_prefix = (
+            f"{base_prefix}/{sub_prefix}" if base_prefix else sub_prefix
+        )
+    else:
+        adopted = _adopt_incomplete_prefix(
+            session, library, base_prefix, now=now or utcnow()
+        )
+        scan_prefix = adopted if adopted is not None else base_prefix
+    scope = (
+        ExternalLibraryScanScope.PREFIX
+        if scan_prefix != base_prefix
+        else ExternalLibraryScanScope.FULL
+    )
+    return scan_prefix, scope
+
+
+def _within_scan_prefix(source_key_column, scan_prefix: str):
+    """SQL predicate bounding a key to exactly one scanned directory tree.
+
+    Only called for a non-empty prefix. ``substr`` (not LIKE) keeps prefixes
+    containing ``_``/``%`` exact, and the trailing slash keeps ``models/sub``
+    from matching ``models/submarine``.
+    """
+    boundary = scan_prefix + "/"
+    return or_(
+        source_key_column == scan_prefix,
+        func.substr(source_key_column, 1, len(boundary)) == boundary,
+    )
+
+
 def _remote_checkpoint(
-    session: Session, library: ExternalLibrary
+    session: Session, library: ExternalLibrary, scan_prefix: str
 ) -> ExternalLibraryCheckpoint:
     checkpoint = session.exec(
         select(ExternalLibraryCheckpoint).where(
-            ExternalLibraryCheckpoint.library_id == library.id
+            ExternalLibraryCheckpoint.library_id == library.id,
+            ExternalLibraryCheckpoint.scan_prefix == scan_prefix,
         )
     ).first()
     if (
@@ -720,7 +824,9 @@ def _remote_checkpoint(
             session.delete(checkpoint)
             session.flush()
         checkpoint = ExternalLibraryCheckpoint(
-            library_id=int(library.id), epoch=uuid.uuid4().hex
+            library_id=int(library.id),
+            scan_prefix=scan_prefix,
+            epoch=uuid.uuid4().hex,
         )
         session.add(checkpoint)
         session.flush()
@@ -730,10 +836,19 @@ def _remote_checkpoint(
 def scan_remote_library(
     library_id: int,
     *,
+    relative_path: str | None = None,
     job_id: str | None = None,
     session_factory: SessionFactory | None = None,
 ) -> dict:
-    """Process one bounded remote page; absence is applied only at epoch end."""
+    """Process one bounded remote page; absence is applied only at epoch end.
+
+    ``relative_path`` narrows the whole run to one subdirectory under the
+    library's ``source_prefix``: discovery, the checkpoint, observations,
+    indexing, tombstones and absence all stay inside that prefix. An
+    interrupted prefix epoch is resumed by the next attempt for the same
+    prefix (including pathless retries/restarts via checkpoint adoption), and
+    completion can only judge missing keys inside the scanned prefix.
+    """
     if session_factory is None:
         session_factory = get_session_factory()
     if not _REMOTE_SCAN_LOCK.acquire(blocking=False):
@@ -751,13 +866,22 @@ def scan_remote_library(
                 raise ValueError(f"external library {library_id} not found")
             if library.source_kind == LibrarySourceKind.MOUNTED:
                 raise ValueError("library_source_is_mounted")
-            checkpoint = _remote_checkpoint(session, library)
+            scan_prefix, scope = _resolve_scan_prefix(
+                session, library, relative_path
+            )
+            scope_fields = {
+                "scope": scope.value,
+                "scan_prefix": scan_prefix,
+            }
+            checkpoint = _remote_checkpoint(session, library, scan_prefix)
             if (
                 checkpoint.backoff_until
                 and ensure_utc(checkpoint.backoff_until) > utcnow()
             ):
                 return {
                     **summary.as_dict(),
+                    **scope_fields,
+                    "complete": checkpoint.complete,
                     "backoff_until": checkpoint.backoff_until.isoformat(),
                 }
             source = source_for_library(library)
@@ -768,7 +892,7 @@ def scan_remote_library(
                 if monotonic() - scan_started >= _REMOTE_SLICE_MAX_SECONDS:
                     raise LibrarySourceError("remote_scan_slice_deadline")
                 page = source.list_page(
-                    library.source_prefix,
+                    scan_prefix,
                     cursor=checkpoint.cursor,
                     limit=_REMOTE_PAGE_LIMIT,
                 )
@@ -865,7 +989,9 @@ def scan_remote_library(
                 checkpoint.updated_at = utcnow()
                 if page.complete:
                     session.flush()
-                    total = session.exec(
+                    # Absence is provable only inside the enumerated prefix: a
+                    # prefix epoch's observations say nothing about siblings.
+                    count_stmt = (
                         select(func.count())
                         .select_from(File)
                         .where(
@@ -873,8 +999,7 @@ def scan_remote_library(
                             live(File),
                             File.source_key != None,  # noqa: E711
                         )
-                    ).one()
-                    removal_limit = min(25, max(1, total // 100))
+                    )
                     seen = exists().where(
                         ExternalLibraryObservation.checkpoint_id == checkpoint.id,
                         ExternalLibraryObservation.file_id == File.id,
@@ -884,16 +1009,23 @@ def scan_remote_library(
                         ExternalLibraryTombstone.source_key == File.source_key,
                         ExternalLibraryTombstone.cleared_at == None,  # noqa: E711
                     )
-                    missing = session.exec(
-                        select(File)
-                        .where(
-                            File.external_library_id == library_id,
-                            live(File),
-                            File.source_key != None,  # noqa: E711
-                            ~seen,
-                            ~suppressed,  # noqa: E711
+                    missing_stmt = select(File).where(
+                        File.external_library_id == library_id,
+                        live(File),
+                        File.source_key != None,  # noqa: E711
+                        ~seen,
+                        ~suppressed,
+                    )
+                    if scan_prefix:
+                        scope_bound = _within_scan_prefix(
+                            File.source_key, scan_prefix
                         )
-                        .limit(removal_limit + 1)
+                        count_stmt = count_stmt.where(scope_bound)
+                        missing_stmt = missing_stmt.where(scope_bound)
+                    total = session.exec(count_stmt).one()
+                    removal_limit = min(25, max(1, total // 100))
+                    missing = session.exec(
+                        missing_stmt.limit(removal_limit + 1)
                     ).all()
                     observed_count = session.exec(
                         select(func.count())
@@ -916,11 +1048,12 @@ def scan_remote_library(
                     ExternalLibraryScanStatus.ERROR
                     if summary.aborted
                     else ExternalLibraryScanStatus.PARTIAL
-                    if summary.errors
+                    if summary.errors or not checkpoint.complete
                     else ExternalLibraryScanStatus.OK
                 )
                 result = {
                     **summary.as_dict(),
+                    **scope_fields,
                     "epoch": checkpoint.epoch,
                     "complete": checkpoint.complete,
                     "cursor": checkpoint.cursor,
@@ -945,7 +1078,7 @@ def scan_remote_library(
                 return result
             except asyncio.CancelledError as exc:
                 session.rollback()
-                checkpoint = _remote_checkpoint(session, library)
+                checkpoint = _remote_checkpoint(session, library, scan_prefix)
                 checkpoint.cursor = (
                     getattr(exc, "discovery_cursor", None) or checkpoint.cursor
                 )
@@ -953,14 +1086,16 @@ def scan_remote_library(
                 library.last_scan_status = ExternalLibraryScanStatus.PARTIAL
                 summary.error = "remote_scan_cancelled"
                 summary.aborted = True
-                library.last_scan_summary = json.dumps(summary.as_dict())
+                library.last_scan_summary = json.dumps(
+                    {**summary.as_dict(), **scope_fields, "complete": False}
+                )
                 session.add(checkpoint)
                 session.add(library)
                 session.commit()
                 raise
             except Exception as exc:
                 session.rollback()
-                checkpoint = _remote_checkpoint(session, library)
+                checkpoint = _remote_checkpoint(session, library, scan_prefix)
                 if getattr(exc, "discovery_cursor", None):
                     checkpoint.cursor = exc.discovery_cursor
                 deadline_reached = str(exc) == "remote_scan_slice_deadline"
@@ -976,13 +1111,15 @@ def scan_remote_library(
                 )
                 summary.error = failure_of(exc)
                 summary.aborted = True
-                library.last_scan_summary = json.dumps(summary.as_dict())
+                library.last_scan_summary = json.dumps(
+                    {**summary.as_dict(), **scope_fields, "complete": False}
+                )
                 session.add(checkpoint)
                 session.add(library)
                 session.commit()
                 if job_id:
                     registry.finish(job_id, JobOutcome.FAILED, error=summary.error)
-                return summary.as_dict()
+                return {**summary.as_dict(), **scope_fields, "complete": False}
     finally:
         budget.__exit__(None, None, None)
         _REMOTE_SCAN_LOCK.release()
@@ -1006,7 +1143,10 @@ def scan_library(
             and source_library.source_kind != LibrarySourceKind.MOUNTED
         ):
             return scan_remote_library(
-                library_id, job_id=job_id, session_factory=session_factory
+                library_id,
+                relative_path=relative_path,
+                job_id=job_id,
+                session_factory=session_factory,
             )
 
     summary = ScanSummary()

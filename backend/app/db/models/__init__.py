@@ -305,6 +305,9 @@ from .types import (
     ExternalLibraryCollectionMode as ExternalLibraryCollectionMode,
 )
 from .types import (
+    ExternalLibraryScanScope as ExternalLibraryScanScope,
+)
+from .types import (
     ExternalLibraryScanStatus as ExternalLibraryScanStatus,
 )
 from .types import (

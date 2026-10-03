@@ -375,9 +375,22 @@ class ExternalLibraryScanStatus(str, Enum):
     OK = "ok"
     ERROR = "error"
     RUNNING = "running"
-    # Scan completed but one or more files failed to index — terminal, like OK,
-    # but surfaces the partial failure instead of a misleading green status.
+    # Scan completed but one or more files failed to index, or the paged remote
+    # epoch still has pages left — terminal for this slice, but not a finished
+    # whole-scope scan, so it never shows a misleading green status.
     PARTIAL = "partial"
+
+
+class ExternalLibraryScanScope(str, Enum):
+    """What namespace one remote scan epoch is evidence for.
+
+    A prefix epoch enumerates only one subdirectory under ``source_prefix``;
+    its completion proves absence only inside that prefix, never for the whole
+    library. A full epoch enumerates the configured ``source_prefix`` itself.
+    """
+
+    FULL = "full"
+    PREFIX = "prefix"
 
 
 class ExternalLibraryWatchMode(str, Enum):

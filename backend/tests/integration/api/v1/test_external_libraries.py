@@ -21,10 +21,12 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
-from app.api.v1.external_libraries import _to_read
+from app.api.v1.external_libraries import _require_source_connection, _to_read
 from app.core.config import _overlay
 from app.core.time import utcnow
 from app.db.models import (
@@ -33,7 +35,9 @@ from app.db.models import (
     File,
     JobKind,
     JobState,
+    LibrarySourceKind,
     Model,
+    StorageConnectionPurpose,
 )
 from app.db.scopes import live
 from app.modules.administration import runtime_config
@@ -41,7 +45,11 @@ from app.modules.sources import external_library
 from app.modules.storage import root_markers
 from app.modules.work.jobs import jobs
 from tests._env import use_local_storage
-from tests.factories import build_collection, build_external_library
+from tests.factories import (
+    build_collection,
+    build_external_library,
+    build_storage_connection,
+)
 from tests.paths import FIXTURES_DIR
 
 FIXTURE_GCODE = FIXTURES_DIR / "sample.gcode"
@@ -845,6 +853,151 @@ class TestScanPath:
         )
         assert resp.status_code == 400
         assert resp.json()["detail"] == "path_missing_or_unreadable"
+
+    def _remote_library(
+        self, db_session: Session, *, connection_overrides: dict | None = None
+    ) -> ExternalLibrary:
+        overrides = {"purpose": StorageConnectionPurpose.LIBRARY}
+        overrides.update(connection_overrides or {})
+        connection = build_storage_connection(db_session, **overrides)
+        return build_external_library(
+            db_session,
+            "",
+            root_identity=None,
+            name="remote",
+            source_kind=LibrarySourceKind.S3,
+            connection_id=connection.id,
+            source_prefix="models",
+            watch_mode="off",
+        )
+
+    def test_scan_path_queues_a_prefix_scan_for_a_remote_library(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session)
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "functional"},
+        )
+
+        assert resp.status_code == 202, resp.text
+        db_session.expire_all()
+        row = db_session.get(ExternalLibrary, lib.id)
+        assert row.scan_requested_path == "functional"
+
+    def test_scan_path_with_blank_remote_path_queues_a_full_source_scan(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session)
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "  / "},
+        )
+
+        assert resp.status_code == 202, resp.text
+        db_session.expire_all()
+        assert db_session.get(ExternalLibrary, lib.id).scan_requested_path is None
+
+    @pytest.mark.parametrize("path", ["a//b", "a/./b", "a\\b"])
+    def test_scan_path_rejects_a_malformed_remote_path(
+        self, path: str, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session)
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": path},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "remote_scan_path_invalid"
+
+    def test_scan_path_rejects_a_remote_path_outside_the_source_prefix(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session)
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "../elsewhere"},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "path_outside_library_root"
+
+    def test_scan_path_requires_a_bound_connection(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session)
+        lib.connection_id = None
+        db_session.add(lib)
+        db_session.commit()
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "functional"},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "storage_connection_required"
+
+    def test_binding_check_reports_a_connection_row_that_is_gone(
+        self, db_session: Session
+    ) -> None:
+        # A clean schema forbids a dangling connection_id (RESTRICT foreign
+        # key), so the legacy-drift binding failure is exercised at its seam:
+        # the endpoint runs this same check before accepting a remote path.
+        _enable_feature(db_session)
+        with pytest.raises(HTTPException) as exc_info:
+            _require_source_connection(db_session, LibrarySourceKind.S3, 999999)
+
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.detail == "storage_connection_not_found"
+
+    def test_scan_path_rejects_a_disabled_bound_connection(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(db_session, connection_overrides={"enabled": False})
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "functional"},
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "storage_connection_incompatible"
+
+    def test_scan_path_rejects_a_connection_without_library_purpose(
+        self, client, db_session: Session, auth_headers: dict
+    ) -> None:
+        _enable_feature(db_session)
+        lib = self._remote_library(
+            db_session,
+            connection_overrides={"purpose": StorageConnectionPurpose.BACKUP},
+        )
+
+        resp = client.post(
+            f"/api/v1/libraries/{lib.id}/scan-path",
+            headers=auth_headers,
+            json={"path": "functional"},
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "storage_connection_incompatible"
 
 
 class TestOverlapGuards:

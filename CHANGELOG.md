@@ -16,6 +16,15 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
 
 ### Added
 
+- Remote (S3/WebDAV/SFTP) libraries now accept a subdirectory scan through
+  `POST /api/v1/libraries/{id}/scan-path`. The run is bound to that prefix:
+  paged discovery, its resumable checkpoint, observations, indexing, tombstones
+  and missing-file removal all stay inside the selected folder, so a prefix
+  completion can never judge keys outside it missing. Interrupted prefix scans
+  resume the same prefix across slices, connection failures and restarts; the
+  scan summary records `scope` (`full`/`prefix`) and `scan_prefix`, with
+  `partial` status until an epoch finishes. Scans without a path keep scanning
+  the whole configured `source_prefix` exactly as before.
 - Deep CI exercises the production mesh pipeline under 1 GiB and 4 GiB
   limits on amd64 and arm64, publishing memory, failure and cleanup evidence.
 - Job details show retained ingest capacity and provide a confirmed, identity-checked

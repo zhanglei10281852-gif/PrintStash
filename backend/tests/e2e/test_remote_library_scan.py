@@ -369,6 +369,121 @@ class TestDurableScanPages:
             assert downloaded.content.startswith(payload)
 
 
+class TestRemotePrefixScanPath:
+    @pytest.mark.s3
+    @pytest.mark.asyncio
+    async def test_public_scan_path_catalog_is_confined_to_the_selected_prefix(
+        self, api, superuser_headers, e2e_db
+    ):
+        provider = await asyncio.to_thread(_s3_provider)
+        in_prefix = (FIXTURES_DIR / "sample.gcode").read_bytes() + b"\n; crit\n"
+        sibling = (FIXTURES_DIR / "sample.gcode").read_bytes() + b"\n; other\n"
+        in_prefix_key = "models/crit/a.gcode"
+        sibling_key = "models/other/b.gcode"
+        await asyncio.to_thread(
+            provider.backend.create_bytes,
+            in_prefix,
+            provider.backend.source_key(in_prefix_key),
+        )
+        await asyncio.to_thread(
+            provider.backend.create_bytes,
+            sibling,
+            provider.backend.source_key(sibling_key),
+        )
+        enabled = await api.put(
+            "/api/v1/config",
+            headers=superuser_headers,
+            json={"external_libraries_enabled": True},
+        )
+        assert enabled.status_code == 200
+        connection = await api.post(
+            "/api/v1/storage-connections",
+            headers=superuser_headers,
+            json={
+                "name": "prefix-source",
+                "kind": "s3",
+                "configuration": provider.configuration,
+                "secrets": provider.secrets,
+            },
+        )
+        assert connection.status_code == 201, connection.text
+        library = await api.post(
+            "/api/v1/libraries",
+            headers=superuser_headers,
+            json={
+                "name": "Prefix source",
+                "source_kind": "s3",
+                "connection_id": connection.json()["id"],
+                "source_prefix": "models",
+                "scan_schedule": "",
+            },
+        )
+        assert library.status_code == 201, library.text
+        library_id = library.json()["id"]
+        url = f"/api/v1/libraries/{library_id}/scan-path"
+
+        scan = await api.post(url, headers=superuser_headers, json={"path": "crit"})
+        assert scan.status_code == 202, scan.text
+        settle()
+        e2e_db.expire_all()
+        rows = e2e_db.exec(
+            select(File).where(File.external_library_id == library_id)
+        ).all()
+        assert {row.source_key for row in rows} == {in_prefix_key}
+        listed = await api.get("/api/v1/libraries", headers=superuser_headers)
+        summary = next(
+            item["last_scan_summary"]
+            for item in listed.json()
+            if item["id"] == library_id
+        )
+        assert summary["scope"] == "prefix"
+        assert summary["scan_prefix"] == "models/crit"
+        assert summary["complete"] is True
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=provider.configuration["endpoint_url"],
+            region_name="us-east-1",
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=BotoConfig(s3={"addressing_style": "path"}),
+        )
+        await asyncio.to_thread(
+            client.delete_object,
+            Bucket=provider.configuration["bucket"],
+            Key=f"library-root/{in_prefix_key}",
+        )
+        assert (
+            await api.post(url, headers=superuser_headers, json={"path": "crit"})
+        ).status_code == 202
+        settle()
+        e2e_db.expire_all()
+        live_rows = e2e_db.exec(
+            select(File).where(
+                File.external_library_id == library_id,
+                File.source_key.in_([in_prefix_key, sibling_key]),
+                File.deleted_at == None,  # noqa: E711
+            )
+        ).all()
+        assert live_rows == []
+        # The sibling outside the scanned prefix was never indexed; the removed
+        # prefix file is soft-deleted, not erased.
+        sibling_rows = e2e_db.exec(
+            select(File).where(
+                File.external_library_id == library_id,
+                File.source_key == sibling_key,
+            )
+        ).all()
+        assert sibling_rows == []
+        removed = e2e_db.exec(
+            select(File).where(
+                File.external_library_id == library_id,
+                File.source_key == in_prefix_key,
+            )
+        ).one()
+        assert removed.deleted_at is not None
+
+
 @pytest_asyncio.fixture
 async def refused_remote_mesh(api, superuser_headers, e2e_db, remote_provider):
     original = b"invalid 3mf package"

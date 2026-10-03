@@ -496,19 +496,34 @@ def scan_path(
     session: Session = Depends(get_session),
 ) -> JobAccepted:
     lib = get_or_404(session, ExternalLibrary, library_id, "library_not_found")
-    if lib.source_kind != LibrarySourceKind.MOUNTED:
-        raise HTTPException(status_code=400, detail="remote_path_scan_unsupported")
-    try:
-        source_root_binding.assert_root_binding(lib)
-    except source_root_binding.ExternalRootBindingError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    root = Path(lib.root_path).resolve()
-    candidate = (root / body.path).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise HTTPException(status_code=400, detail="path_outside_library_root")
-    if not candidate.is_dir() or not os.access(candidate, os.R_OK):
-        raise HTTPException(status_code=400, detail="path_missing_or_unreadable")
-    return _queue_scan(session, library_id, user=current_user, relative_path=body.path)
+    if lib.source_kind == LibrarySourceKind.MOUNTED:
+        try:
+            source_root_binding.assert_root_binding(lib)
+        except source_root_binding.ExternalRootBindingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        root = Path(lib.root_path).resolve()
+        candidate = (root / body.path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise HTTPException(status_code=400, detail="path_outside_library_root")
+        if not candidate.is_dir() or not os.access(candidate, os.R_OK):
+            raise HTTPException(status_code=400, detail="path_missing_or_unreadable")
+        relative_path: Optional[str] = body.path
+    else:
+        # The bound connection is the remote equivalent of the root binding:
+        # it must exist, be enabled, and still be a library-purpose connection
+        # of this exact kind before any path is accepted.
+        _require_source_connection(session, lib.source_kind, lib.connection_id)
+        try:
+            # A blank selection means the configured source_prefix itself.
+            relative_path = external_library.normalize_remote_scan_path(body.path)
+        except external_library.LibrarySourceError as exc:
+            detail = str(exc)
+            if detail not in {"path_outside_library_root", "remote_scan_path_invalid"}:
+                detail = "remote_scan_path_invalid"
+            raise HTTPException(status_code=400, detail=detail) from exc
+    return _queue_scan(
+        session, library_id, user=current_user, relative_path=relative_path
+    )
 
 
 @router.post(
