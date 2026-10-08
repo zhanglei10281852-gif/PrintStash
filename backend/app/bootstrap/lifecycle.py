@@ -190,6 +190,31 @@ def _prepare_storage_for_startup(
             reconcile_jobs(session)
             prune_expired(session, backend=backend)
             session.commit()
+        # Restart convergence for embedded image claims: bodies and their
+        # reference ledger normally commit together, so this repairs only the
+        # interrupted/legacy edge. Ledger-only and never destructive.
+        try:
+            from app.modules.library.embedded_images import (
+                reconcile_embedded_image_references,
+            )
+
+            with get_session_factory().scoped_session() as session:
+                stats = reconcile_embedded_image_references(session)
+                session.commit()
+            if (
+                stats.claims_added
+                or stats.claims_removed
+                or stats.retirements_reclaimed
+            ):
+                logger.warning(
+                    "reconciled embedded image references "
+                    "added=%s removed=%s reclaimed=%s",
+                    stats.claims_added,
+                    stats.claims_removed,
+                    stats.retirements_reclaimed,
+                )
+        except Exception:
+            logger.exception("embedded image reference reconciliation failed")
     return backend
 
 
@@ -258,6 +283,9 @@ def prepare_process(*, owner: bool) -> PreparedProcess:
         logger.critical(
             "interrupted restore detected; application remains in restore maintenance"
         )
+    from app.bootstrap.native_resources import configure as configure_native_resources
+
+    configure_native_resources(Path(settings.data_root))
     # Storage must be configured and bound before either publication recovery
     # or Inbox recovery can inspect durable capture-slot receipts.
     backend = _prepare_storage_for_startup(

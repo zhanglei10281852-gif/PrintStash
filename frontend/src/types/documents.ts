@@ -14,6 +14,13 @@ export interface DocumentListItem {
   updated_at: string;
 }
 
+export type EmbeddedImageState = {
+  name: string;
+  state: "current" | "retiring";
+  removed_at: string | null;
+};
+
 export interface DocumentRead extends DocumentListItem {
   body: string | null;
+  images: EmbeddedImageState[];
 }

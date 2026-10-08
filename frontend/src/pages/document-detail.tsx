@@ -76,6 +76,7 @@ export default function DocumentDetailPage({
       effective_role: "edit",
       updated_at: "",
       body: "",
+      images: [],
     }),
     [collectionParam, collectionId, locale],
   );

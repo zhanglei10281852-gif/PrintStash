@@ -3640,6 +3640,13 @@
       },
       "CollectionReadmeRead": {
         "properties": {
+          "images": {
+            "items": {
+              "$ref": "#/components/schemas/EmbeddedImageState"
+            },
+            "title": "Images",
+            "type": "array"
+          },
           "readme": {
             "anyOf": [
               {
@@ -4102,7 +4109,8 @@
         "enum": [
           "metadata",
           "thumbnail",
-          "toolpath"
+          "toolpath",
+          "viewer_stl"
         ],
         "title": "DerivativeKind",
         "type": "string"
@@ -4402,6 +4410,13 @@
             "title": "Id",
             "type": "integer"
           },
+          "images": {
+            "items": {
+              "$ref": "#/components/schemas/EmbeddedImageState"
+            },
+            "title": "Images",
+            "type": "array"
+          },
           "kind": {
             "$ref": "#/components/schemas/DocumentKind"
           },
@@ -4478,6 +4493,41 @@
           "job_id"
         ],
         "title": "DownloadRead",
+        "type": "object"
+      },
+      "EmbeddedImageState": {
+        "description": "One image in the owner namespace with its lifecycle state.\n\n``current`` images are referenced by the document body; ``retiring`` ones\nwere removed by a precise edit and remain stored and reclaimable until the\ndocument is permanently deleted.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "removed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Removed At"
+          },
+          "state": {
+            "enum": [
+              "current",
+              "retiring"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state"
+        ],
+        "title": "EmbeddedImageState",
         "type": "object"
       },
       "EndpointProposal": {
@@ -6768,6 +6818,7 @@
           "derivatives.gcode",
           "derivatives.mesh",
           "derivatives.toolpath",
+          "derivatives.viewer_stl",
           "identity.retention",
           "inference.model_download",
           "ingestion.archive_inspect",
@@ -6782,6 +6833,7 @@
           "ingestion.upload_recovery",
           "ingestion.url",
           "ingestion.url_selection",
+          "ingestion.scratch_cleanup",
           "notifications.deliver",
           "notifications.retention",
           "printing.dispatch",
@@ -7230,6 +7282,49 @@
         "additionalProperties": true,
         "description": "Compatibility wrapper for the pre-capture manifest variants.",
         "title": "LegacyInboxManifestRead",
+        "type": "object"
+      },
+      "LegacyUnassessedVolumeRead": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "title": "Cause",
+            "type": "null"
+          },
+          "method": {
+            "title": "Method",
+            "type": "null"
+          },
+          "state": {
+            "const": "legacy_unassessed",
+            "title": "State",
+            "type": "string"
+          },
+          "unit": {
+            "const": "mm3",
+            "title": "Unit",
+            "type": "string"
+          },
+          "value_mm3": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value Mm3"
+          }
+        },
+        "required": [
+          "unit",
+          "state",
+          "method",
+          "value_mm3",
+          "cause"
+        ],
+        "title": "LegacyUnassessedVolumeRead",
         "type": "object"
       },
       "LibraryCreate": {
@@ -8598,11 +8693,50 @@
         "title": "MaterialToolWrite",
         "type": "object"
       },
+      "MeasuredVolumeRead": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "title": "Cause",
+            "type": "null"
+          },
+          "method": {
+            "const": "mesh_surface_integral",
+            "title": "Method",
+            "type": "string"
+          },
+          "state": {
+            "const": "measured",
+            "title": "State",
+            "type": "string"
+          },
+          "unit": {
+            "const": "mm3",
+            "title": "Unit",
+            "type": "string"
+          },
+          "value_mm3": {
+            "exclusiveMinimum": 0.0,
+            "title": "Value Mm3",
+            "type": "number"
+          }
+        },
+        "required": [
+          "unit",
+          "state",
+          "method",
+          "value_mm3",
+          "cause"
+        ],
+        "title": "MeasuredVolumeRead",
+        "type": "object"
+      },
       "MetadataRead": {
         "properties": {
           "bbox_x_mm": {
             "anyOf": [
               {
+                "minimum": 0.0,
                 "type": "number"
               },
               {
@@ -8614,6 +8748,7 @@
           "bbox_y_mm": {
             "anyOf": [
               {
+                "minimum": 0.0,
                 "type": "number"
               },
               {
@@ -8625,6 +8760,7 @@
           "bbox_z_mm": {
             "anyOf": [
               {
+                "minimum": 0.0,
                 "type": "number"
               },
               {
@@ -8852,6 +8988,32 @@
             ],
             "title": "Triangle Count"
           },
+          "volume_measurement": {
+            "discriminator": {
+              "mapping": {
+                "legacy_unassessed": "#/components/schemas/LegacyUnassessedVolumeRead",
+                "measured": "#/components/schemas/MeasuredVolumeRead",
+                "not_calculated": "#/components/schemas/NotCalculatedVolumeRead",
+                "unavailable": "#/components/schemas/UnavailableVolumeRead"
+              },
+              "propertyName": "state"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MeasuredVolumeRead"
+              },
+              {
+                "$ref": "#/components/schemas/UnavailableVolumeRead"
+              },
+              {
+                "$ref": "#/components/schemas/NotCalculatedVolumeRead"
+              },
+              {
+                "$ref": "#/components/schemas/LegacyUnassessedVolumeRead"
+              }
+            ],
+            "title": "Volume Measurement"
+          },
           "volume_mm3": {
             "anyOf": [
               {
@@ -8875,6 +9037,9 @@
             "title": "Wall Loops"
           }
         },
+        "required": [
+          "volume_measurement"
+        ],
         "title": "MetadataRead",
         "type": "object"
       },
@@ -11420,6 +11585,41 @@
         "title": "MultipartPartsReplace",
         "type": "object"
       },
+      "NotCalculatedVolumeRead": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/VolumeNotCalculatedCause"
+          },
+          "method": {
+            "title": "Method",
+            "type": "null"
+          },
+          "state": {
+            "const": "not_calculated",
+            "title": "State",
+            "type": "string"
+          },
+          "unit": {
+            "const": "mm3",
+            "title": "Unit",
+            "type": "string"
+          },
+          "value_mm3": {
+            "title": "Value Mm3",
+            "type": "null"
+          }
+        },
+        "required": [
+          "unit",
+          "state",
+          "method",
+          "value_mm3",
+          "cause"
+        ],
+        "title": "NotCalculatedVolumeRead",
+        "type": "object"
+      },
       "NotificationTarget": {
         "description": "Where a notification is delivered.",
         "enum": [
@@ -11880,6 +12080,303 @@
         "title": "OrcaSourceContext",
         "type": "object"
       },
+      "OutlinerCollection": {
+        "properties": {
+          "child_count": {
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "descendant_count": {
+            "title": "Descendant Count",
+            "type": "integer"
+          },
+          "direct_entry_count": {
+            "title": "Direct Entry Count",
+            "type": "integer"
+          },
+          "display_path": {
+            "title": "Display Path",
+            "type": "string"
+          },
+          "effective_role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CollectionRole"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "has_readme": {
+            "default": false,
+            "title": "Has Readme",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "model_count": {
+            "default": 0,
+            "title": "Model Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Id"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "subtree_entry_count": {
+            "title": "Subtree Entry Count",
+            "type": "integer"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "visible_child_count": {
+            "title": "Visible Child Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "path",
+          "child_count",
+          "descendant_count",
+          "display_path",
+          "direct_entry_count",
+          "subtree_entry_count",
+          "visible_child_count"
+        ],
+        "title": "OutlinerCollection",
+        "type": "object"
+      },
+      "OutlinerCollectionMatch": {
+        "properties": {
+          "collection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection"
+          },
+          "collection_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Id"
+          },
+          "collection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Label"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "collection",
+            "default": "collection",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "OutlinerCollectionMatch",
+        "type": "object"
+      },
+      "OutlinerCollectionPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OutlinerCollection"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "parent_direct_entry_count": {
+            "title": "Parent Direct Entry Count",
+            "type": "integer"
+          },
+          "revealed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OutlinerCollection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "parent_direct_entry_count",
+          "revealed"
+        ],
+        "title": "OutlinerCollectionPage",
+        "type": "object"
+      },
+      "OutlinerEntryPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "model": "#/components/schemas/OutlinerModel",
+                  "multipart": "#/components/schemas/OutlinerMultipart"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/OutlinerModel"
+                },
+                {
+                  "$ref": "#/components/schemas/OutlinerMultipart"
+                }
+              ]
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "title": "OutlinerEntryPage",
+        "type": "object"
+      },
+      "OutlinerModel": {
+        "properties": {
+          "collection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection"
+          },
+          "collection_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Id"
+          },
+          "collection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Label"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "model",
+            "default": "model",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "OutlinerModel",
+        "type": "object"
+      },
       "OutlinerModelRead": {
         "properties": {
           "collection": {
@@ -11930,6 +12427,119 @@
         ],
         "title": "OutlinerModelRead",
         "type": "object"
+      },
+      "OutlinerMultipart": {
+        "properties": {
+          "collection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection"
+          },
+          "collection_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Id"
+          },
+          "collection_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Label"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "multipart",
+            "default": "multipart",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "OutlinerMultipart",
+        "type": "object"
+      },
+      "OutlinerSearchPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "collection": "#/components/schemas/OutlinerCollectionMatch",
+                  "model": "#/components/schemas/OutlinerModel",
+                  "multipart": "#/components/schemas/OutlinerMultipart"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/OutlinerModel"
+                },
+                {
+                  "$ref": "#/components/schemas/OutlinerMultipart"
+                },
+                {
+                  "$ref": "#/components/schemas/OutlinerCollectionMatch"
+                }
+              ]
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "title": "OutlinerSearchPage",
+        "type": "object"
+      },
+      "OutlinerView": {
+        "enum": [
+          "all",
+          "organized",
+          "multipart",
+          "components"
+        ],
+        "title": "OutlinerView",
+        "type": "string"
       },
       "ParseSearchRequest": {
         "additionalProperties": false,
@@ -18420,6 +19030,42 @@
         "title": "TrashedSourceFileRead",
         "type": "object"
       },
+      "UnavailableVolumeRead": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/VolumeUnavailableCause"
+          },
+          "method": {
+            "const": "mesh_surface_integral",
+            "title": "Method",
+            "type": "string"
+          },
+          "state": {
+            "const": "unavailable",
+            "title": "State",
+            "type": "string"
+          },
+          "unit": {
+            "const": "mm3",
+            "title": "Unit",
+            "type": "string"
+          },
+          "value_mm3": {
+            "title": "Value Mm3",
+            "type": "null"
+          }
+        },
+        "required": [
+          "unit",
+          "state",
+          "method",
+          "value_mm3",
+          "cause"
+        ],
+        "title": "UnavailableVolumeRead",
+        "type": "object"
+      },
       "UrlIngestRequest": {
         "description": "Body for POST /ingest/url.\n\n``url`` may be a direct file/.zip link *or* a model *page* on a supported\nhost (Printables / Thingiverse); pages are resolved to their download link\nserver-side. Authenticated MakerWorld packages are captured by the browser\nextension and uploaded through the inbox. The optional cookie fields remain\naccepted for backwards compatibility; ``makerworld_cookie`` is ignored.",
         "properties": {
@@ -19863,6 +20509,28 @@
         ],
         "title": "VolumeEvidence",
         "type": "object"
+      },
+      "VolumeNotCalculatedCause": {
+        "enum": [
+          "enrichment_pending",
+          "not_applicable",
+          "not_requested",
+          "geometry_unavailable",
+          "topology_not_evaluated"
+        ],
+        "title": "VolumeNotCalculatedCause",
+        "type": "string"
+      },
+      "VolumeUnavailableCause": {
+        "enum": [
+          "not_watertight",
+          "inconsistent_winding",
+          "non_positive_integral",
+          "nonfinite_integral",
+          "measurement_failed"
+        ],
+        "title": "VolumeUnavailableCause",
+        "type": "string"
       },
       "WorkOverview": {
         "properties": {
@@ -25470,7 +26138,7 @@
     },
     "/api/v1/files/{file_id}/derivatives": {
       "get": {
-        "description": "Every derivative kind that applies to the Artifact (metadata, thumbnail, toolpath) with its state. `pending` means no attempt exists yet at the current recipe, so every value the kind supplies is still unknown.",
+        "description": "Every derivative kind that applies to the Artifact (metadata, thumbnail, toolpath, and requested viewer STL) with its state. `pending` means no attempt exists yet at the current recipe, so every value the kind supplies is still unknown.",
         "operationId": "list_file_derivatives_api_v1_files__file_id__derivatives_get",
         "parameters": [
           {
@@ -25829,7 +26497,7 @@
     },
     "/api/v1/files/{file_id}/stl": {
       "get": {
-        "description": "If the file is already STL it is served directly. 3MF and OBJ files are converted to binary STL on the fly via trimesh.",
+        "description": "If the file is already STL it is served directly. 3MF and OBJ files are converted to binary STL by background Jobs on first viewer access. Pending previews return 202; failed previews return 422 with their reason.",
         "operationId": "file_as_stl_api_v1_files__file_id__stl_get",
         "parameters": [
           {
@@ -34987,6 +35655,1404 @@
         "summary": "Recent notification deliveries",
         "tags": [
           "notifications"
+        ]
+      }
+    },
+    "/api/v1/outliner/collections": {
+      "get": {
+        "operationId": "collections_api_v1_outliner_collections_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection"
+            }
+          },
+          {
+            "in": "query",
+            "name": "direct",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Direct",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Tag",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_presence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "any",
+                    "none"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Presence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "favorites",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Favorites",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "file_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileType"
+              },
+              "title": "File Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "material_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Material Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "slicer_name",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Slicer Name",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_model",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Printer Model",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision_status",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileRevisionStatus"
+              },
+              "title": "Revision Status",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printed",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printed"
+            }
+          },
+          {
+            "in": "query",
+            "name": "print_outcome",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/PrintJobState"
+              },
+              "title": "Print Outcome",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "storage",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "vault",
+                  "external"
+                ],
+                "type": "string"
+              },
+              "title": "Storage",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded Before"
+            }
+          },
+          {
+            "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+            "in": "query",
+            "name": "printed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+              "title": "Printed After"
+            }
+          },
+          {
+            "description": "Exclusive finished_at upper bound.",
+            "in": "query",
+            "name": "printed_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive finished_at upper bound.",
+              "title": "Printed Before"
+            }
+          },
+          {
+            "description": "Inclusive actual PrintJob duration; null durations do not match.",
+            "in": "query",
+            "name": "print_duration_min_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive actual PrintJob duration; null durations do not match.",
+              "title": "Print Duration Min S"
+            }
+          },
+          {
+            "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+            "in": "query",
+            "name": "print_duration_max_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+              "title": "Print Duration Max S"
+            }
+          },
+          {
+            "in": "query",
+            "name": "has_similar_candidates",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Has Similar Candidates"
+            }
+          },
+          {
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OutlinerView",
+              "default": "all"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reveal_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Reveal Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutlinerCollectionPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Collections",
+        "tags": [
+          "outliner"
+        ]
+      }
+    },
+    "/api/v1/outliner/entries": {
+      "get": {
+        "operationId": "entries_api_v1_outliner_entries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection"
+            }
+          },
+          {
+            "in": "query",
+            "name": "direct",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Direct",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Tag",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_presence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "any",
+                    "none"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Presence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "favorites",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Favorites",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "file_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileType"
+              },
+              "title": "File Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "material_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Material Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "slicer_name",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Slicer Name",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_model",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Printer Model",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision_status",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileRevisionStatus"
+              },
+              "title": "Revision Status",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printed",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printed"
+            }
+          },
+          {
+            "in": "query",
+            "name": "print_outcome",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/PrintJobState"
+              },
+              "title": "Print Outcome",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "storage",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "vault",
+                  "external"
+                ],
+                "type": "string"
+              },
+              "title": "Storage",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded Before"
+            }
+          },
+          {
+            "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+            "in": "query",
+            "name": "printed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+              "title": "Printed After"
+            }
+          },
+          {
+            "description": "Exclusive finished_at upper bound.",
+            "in": "query",
+            "name": "printed_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive finished_at upper bound.",
+              "title": "Printed Before"
+            }
+          },
+          {
+            "description": "Inclusive actual PrintJob duration; null durations do not match.",
+            "in": "query",
+            "name": "print_duration_min_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive actual PrintJob duration; null durations do not match.",
+              "title": "Print Duration Min S"
+            }
+          },
+          {
+            "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+            "in": "query",
+            "name": "print_duration_max_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+              "title": "Print Duration Max S"
+            }
+          },
+          {
+            "in": "query",
+            "name": "has_similar_candidates",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Has Similar Candidates"
+            }
+          },
+          {
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OutlinerView",
+              "default": "all"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reveal_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Reveal Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutlinerEntryPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Entries",
+        "tags": [
+          "outliner"
+        ]
+      }
+    },
+    "/api/v1/outliner/search": {
+      "get": {
+        "operationId": "search_api_v1_outliner_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection"
+            }
+          },
+          {
+            "in": "query",
+            "name": "direct",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Direct",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Tag",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_presence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "any",
+                    "none"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printer Presence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "favorites",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Favorites",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "file_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileType"
+              },
+              "title": "File Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "material_type",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Material Type",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "slicer_name",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Slicer Name",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printer_model",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Printer Model",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision_status",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/FileRevisionStatus"
+              },
+              "title": "Revision Status",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "printed",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Printed"
+            }
+          },
+          {
+            "in": "query",
+            "name": "print_outcome",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/PrintJobState"
+              },
+              "title": "Print Outcome",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "storage",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "vault",
+                  "external"
+                ],
+                "type": "string"
+              },
+              "title": "Storage",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uploaded_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uploaded Before"
+            }
+          },
+          {
+            "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+            "in": "query",
+            "name": "printed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive finished_at lower bound; UTC when no offset is supplied.",
+              "title": "Printed After"
+            }
+          },
+          {
+            "description": "Exclusive finished_at upper bound.",
+            "in": "query",
+            "name": "printed_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive finished_at upper bound.",
+              "title": "Printed Before"
+            }
+          },
+          {
+            "description": "Inclusive actual PrintJob duration; null durations do not match.",
+            "in": "query",
+            "name": "print_duration_min_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive actual PrintJob duration; null durations do not match.",
+              "title": "Print Duration Min S"
+            }
+          },
+          {
+            "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+            "in": "query",
+            "name": "print_duration_max_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclusive actual PrintJob duration: under three hours is 10800.",
+              "title": "Print Duration Max S"
+            }
+          },
+          {
+            "in": "query",
+            "name": "has_similar_candidates",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Has Similar Candidates"
+            }
+          },
+          {
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OutlinerView",
+              "default": "all"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collection_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reveal_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Reveal Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutlinerSearchPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Search",
+        "tags": [
+          "outliner"
         ]
       }
     },

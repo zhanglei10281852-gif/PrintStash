@@ -39,7 +39,11 @@ from app.db.scopes import live
 from app.db.session import get_session_factory
 from app.modules.administration import audit
 from app.modules.storage.storage_backend.runtime import get_backend
-from app.modules.storage.storage_utils import OwnedBlob, ownership_snapshot
+from app.modules.storage.storage_utils import (
+    OwnedBlob,
+    StorageOwnershipSnapshot,
+    ownership_snapshot,
+)
 from app.schemas.maintenance import VaultAuditFindingRead, VaultAuditRunRead
 
 if TYPE_CHECKING:
@@ -589,6 +593,97 @@ def _check_database(session: Session, run: VaultAuditRun) -> None:
                     )
 
 
+def _check_embedded_retirements(
+    session: Session, run: VaultAuditRun, snapshot: StorageOwnershipSnapshot
+) -> None:
+    """Classify the observable pending-retirement set present vs missing."""
+    backend = get_backend()
+    for blob in snapshot.retiring:
+        if not _blob_is_live(session, blob):
+            continue
+        if _cancelled(session, run):
+            return
+        details = {"resource_id": blob.resource_id, "name": _safe_name(blob)}
+        if not backend.exists(blob.key):
+            _add(
+                session,
+                run,
+                code="embedded_image_missing",
+                severity=VaultAuditSeverity.WARNING,
+                resource_type=blob.resource_type,
+                identifier=_safe_name(blob),
+                details={**details, "state": "retiring"},
+            )
+            continue
+        _add(
+            session,
+            run,
+            code="embedded_image_retiring",
+            severity=VaultAuditSeverity.INFO,
+            resource_type=blob.resource_type,
+            identifier=_safe_name(blob),
+            details=details,
+        )
+
+
+def _embedded_owner_exists(
+    session: Session, kind: str, owner_id: int
+) -> bool:
+    model = Document if kind == "document" else Collection
+    return session.get(model, owner_id) is not None
+
+
+def _referrer_live(session: Session, kind: str, referrer_id: int) -> bool:
+    model = Document if kind == "document" else Collection
+    row = session.get(model, referrer_id)
+    return row is not None and row.deleted_at is None
+
+
+def _add_cross_reference_findings(
+    session: Session, run: VaultAuditRun, snapshot: StorageOwnershipSnapshot
+) -> None:
+    """Cross-namespace references and same-name objects in other namespaces."""
+    grouped: dict[tuple[str, int, str], list[tuple[str, int]]] = {}
+    for ref in snapshot.cross_references:
+        if not _referrer_live(session, ref.referrer_kind.value, ref.referrer_id):
+            continue
+        grouped.setdefault(
+            (ref.owner_kind.value, ref.owner_id, ref.name), []
+        ).append((ref.referrer_kind.value, ref.referrer_id))
+    for (owner_kind, owner_id, name), referrers in sorted(grouped.items()):
+        unique_referrers = sorted(set(referrers))
+        _add(
+            session,
+            run,
+            code="embedded_image_cross_reference",
+            severity=VaultAuditSeverity.WARNING,
+            resource_type=f"{owner_kind}_image",
+            identifier=name,
+            details={
+                "owner_kind": owner_kind,
+                "owner_id": owner_id,
+                "name": name,
+                "owner_exists": _embedded_owner_exists(session, owner_kind, owner_id),
+                "referrers": [
+                    {"kind": kind, "id": ident} for kind, ident in unique_referrers
+                ],
+                "referrer_kind": unique_referrers[0][0],
+                "referrer_id": unique_referrers[0][1],
+            },
+            repair_action="reclaim_embedded_image",
+        )
+    for name, owners in sorted(snapshot.shared_names.items()):
+        _add(
+            session,
+            run,
+            code="embedded_image_shared_name",
+            severity=VaultAuditSeverity.INFO,
+            resource_type="embedded_image",
+            identifier=name,
+            details={"name": name, "owners": owners},
+        )
+
+
 def _check_external(
     session: Session, run: VaultAuditRun, blobs: list[OwnedBlob]
 ) -> None:
@@ -917,8 +1012,11 @@ def _execute_run(
                         details={
                             "resource_id": blob.resource_id,
                             "name": _safe_name(blob),
+                            "state": "current",
                         },
                     )
+            _check_embedded_retirements(session, run, snapshot)
+            _add_cross_reference_findings(session, run, snapshot)
             claimed = snapshot.claimed_keys
             for key in sorted(snapshot.discovered_keys - claimed):
                 normalized = key.replace("\\", "/")
@@ -1134,6 +1232,18 @@ def repair_finding(
 
         summary = scan_library(int(details["library_id"]))
         ok = not bool(summary.get("aborted_unmounted"))
+    elif row.repair_action == "reclaim_embedded_image":
+        from app.db.models import EmbeddedImageOwnerKind
+        from app.modules.library.embedded_images import reclaim_cross_reference
+
+        ok = reclaim_cross_reference(
+            session,
+            owner_kind=EmbeddedImageOwnerKind(str(details["owner_kind"])),
+            owner_id=int(details["owner_id"]),
+            referrer_kind=EmbeddedImageOwnerKind(str(details["referrer_kind"])),
+            referrer_id=int(details["referrer_id"]),
+            name=str(details["name"]),
+        )
     if not ok:
         return row
     row.state = VaultAuditFindingState.RESOLVED

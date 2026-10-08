@@ -209,14 +209,37 @@ class TestCreateGcPlan:
         db_session.commit()
 
         model_candidate = gc_planner._model_candidate(db_session, model)  # noqa: SLF001
-        document_candidate = gc_planner._document_candidate(document)  # noqa: SLF001
-        collection_candidate = gc_planner._collection_candidate(collection)  # noqa: SLF001
+        document_candidate = gc_planner._document_candidate(db_session, document)  # noqa: SLF001
+        collection_candidate = gc_planner._collection_candidate(db_session, collection)  # noqa: SLF001
 
         assert model_candidate.key_count == 4
         assert model_candidate.size_bytes == 123
         assert gc_planner._file_metrics(external) == (0, 0)  # noqa: SLF001
         assert document_candidate.key_count == 2
         assert collection_candidate.key_count == 1
+
+        # Pending retirements are part of the exact purge scope as well.
+        from app.db.models import EmbeddedImageOwnerKind
+        from tests.factories import build_embedded_image_retirement
+
+        build_embedded_image_retirement(
+            db_session, owner_id=document.id, name="r" * 64 + ".png"
+        )
+        build_embedded_image_retirement(
+            db_session,
+            owner_kind=EmbeddedImageOwnerKind.COLLECTION,
+            owner_id=collection.id,
+            name="s" * 64 + ".webp",
+        )
+        db_session.commit()
+        assert (
+            gc_planner._document_candidate(db_session, document).key_count  # noqa: SLF001
+            == 3
+        )
+        assert (
+            gc_planner._collection_candidate(db_session, collection).key_count  # noqa: SLF001
+            == 2
+        )
 
     def test_batch_limits_stop_before_unsafe_candidates(
         self, db_session: Session
@@ -921,7 +944,7 @@ class TestFinalizeGcPlan:
         monkeypatch.setattr(gc_planner, "_resource", lambda *_args: resource)
         monkeypatch.setattr(
             f"app.modules.library.trash.{function_name}",
-            lambda _session, row: called.append(row),
+            lambda _session, row, *, prepared_deletions: called.append(row),
         )
         monkeypatch.setattr(
             "app.modules.storage.storage_deletion.process_storage_delete_intents",

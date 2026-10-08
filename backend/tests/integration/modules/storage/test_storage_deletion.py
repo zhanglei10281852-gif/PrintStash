@@ -418,6 +418,123 @@ class TestProcessStorageDeleteIntents:
 
         assert result == type(result)()
 
+    def test_blocks_image_cleanup_when_a_new_cross_reference_appeared(
+        self, db_session: Session, tmp_path
+    ) -> None:
+        # The cleanup/re-reference interleave: purge authorized this exact key
+        # in the owner's delete transaction; before the outbox processor runs,
+        # another document embeds the URL. The late claim fences the bytes.
+        from dataclasses import replace
+
+        from app.core.config import _overlay
+        from app.db.models import EmbeddedImageOwnerKind
+        from app.modules.storage.storage_backend.local import LocalStorageBackend
+        from app.modules.storage.storage_backend.runtime import bind_backend
+        from app.modules.storage.storage_deletion import enqueue_prevalidated_receipt
+        from app.modules.storage.storage_ownership import provider_ref_for_backend
+        from tests._env import use_local_storage
+        from tests.factories import (
+            build_document,
+            build_embedded_image_claim,
+            store_owned_bytes,
+        )
+
+        _overlay["storage_backend"] = "local"
+        use_local_storage(tmp_path)
+        bind_backend(LocalStorageBackend())
+        owner = build_document(db_session, "image-owner")
+        referrer = build_document(db_session, "late-referrer")
+        backend = get_backend()
+        name = "d" * 64 + ".png"
+        key = backend.document_image_key(owner.id, name)
+        receipt = store_owned_bytes(
+            db_session,
+            backend,
+            key,
+            b"still referenced",
+            object_kind="document_image",
+        )
+        receipt = replace(
+            receipt,
+            provider_ref=provider_ref_for_backend(
+                backend, namespace=receipt.namespace
+            ),
+        )
+        enqueue_prevalidated_receipt(
+            db_session,
+            receipt,
+            object_kind="document_image",
+            sha256=hashlib.sha256(b"still referenced").hexdigest(),
+            resource_kind="document_image",
+            resource_id=owner.id,
+        )
+        db_session.commit()
+        build_embedded_image_claim(
+            db_session,
+            owner_kind=EmbeddedImageOwnerKind.DOCUMENT,
+            owner_id=owner.id,
+            referrer_kind=EmbeddedImageOwnerKind.DOCUMENT,
+            referrer_id=referrer.id,
+            name=name,
+        )
+        db_session.commit()
+
+        result = process_storage_delete_intents()
+
+        assert result.blocked == 1
+        assert backend.exists(key)
+        intent = _intents(db_session)[0]
+        assert intent.status == "blocked"
+        assert intent.last_error == "image_still_referenced"
+
+    def test_removes_an_image_only_the_owner_ever_claimed(
+        self, db_session: Session, tmp_path
+    ) -> None:
+        from dataclasses import replace
+
+        from app.core.config import _overlay
+        from app.modules.storage.storage_backend.local import LocalStorageBackend
+        from app.modules.storage.storage_backend.runtime import bind_backend
+        from app.modules.storage.storage_deletion import enqueue_prevalidated_receipt
+        from app.modules.storage.storage_ownership import provider_ref_for_backend
+        from tests._env import use_local_storage
+        from tests.factories import build_document, store_owned_bytes
+
+        _overlay["storage_backend"] = "local"
+        use_local_storage(tmp_path)
+        bind_backend(LocalStorageBackend())
+        owner = build_document(db_session, "image-owner")
+        backend = get_backend()
+        name = "e" * 64 + ".png"
+        key = backend.document_image_key(owner.id, name)
+        receipt = store_owned_bytes(
+            db_session,
+            backend,
+            key,
+            b"owner only",
+            object_kind="document_image",
+        )
+        receipt = replace(
+            receipt,
+            provider_ref=provider_ref_for_backend(
+                backend, namespace=receipt.namespace
+            ),
+        )
+        enqueue_prevalidated_receipt(
+            db_session,
+            receipt,
+            object_kind="document_image",
+            sha256=hashlib.sha256(b"owner only").hexdigest(),
+            resource_kind="document_image",
+            resource_id=owner.id,
+        )
+        db_session.commit()
+
+        result = process_storage_delete_intents()
+
+        assert result.completed == 1, _intents(db_session)[0].last_error
+        assert not backend.exists(key)
+
     def test_blocks_an_intent_written_for_a_different_backend(
         self, db_session: Session, owned
     ) -> None:
@@ -523,16 +640,16 @@ class TestProcessStorageDeleteIntents:
         def crash_after_pending(*_args: object, **_kwargs: object) -> bool:
             raise KeyboardInterrupt("worker crashed")
 
-        monkeypatch.setattr(get_backend(), "rollback_create", crash_after_pending)
-        with pytest.raises(KeyboardInterrupt):
-            process_storage_delete_intents()
+        with monkeypatch.context() as fault:
+            fault.setattr(get_backend(), "rollback_create", crash_after_pending)
+            with pytest.raises(KeyboardInterrupt):
+                process_storage_delete_intents()
 
         pending = _intents(db_session)[0]
         assert pending.status == "pending"
         assert pending.quarantine_state == "pending"
         assert get_backend().exists(key)
 
-        monkeypatch.undo()
         result = process_storage_delete_intents()
 
         assert result.completed == 1

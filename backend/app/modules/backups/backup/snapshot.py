@@ -150,7 +150,12 @@ def _find_blobs(session: Session | None = None) -> list[tuple[str, int]]:
             return _find_blobs(owned_session)
 
     snapshot = ownership_snapshot(session, discover=False)
-    keys = sorted({blob.key for blob in [*snapshot.primary, *snapshot.embedded]})
+    keys = sorted(
+        {
+            blob.key
+            for blob in [*snapshot.primary, *snapshot.embedded, *snapshot.retiring]
+        }
+    )
     backend = get_backend()
     out: list[tuple[str, int]] = []
     for key in keys:
@@ -177,30 +182,39 @@ def _manifest_blobs(snapshot_path: Path) -> list[dict[str, str | int]]:
     try:
         with Session(engine) as session:
             snapshot = ownership_snapshot(session, discover=False)
-            external_keys = {blob.key for blob in snapshot.external}
             required_keys = {
-                blob.key for blob in [*snapshot.primary, *snapshot.embedded]
+                blob.key
+                for blob in [
+                    *snapshot.primary,
+                    *snapshot.embedded,
+                    *snapshot.retiring,
+                ]
             }
             rebuildable_keys = {
                 blob.key for blob in snapshot.derived if blob.key not in required_keys
             }
-            blobs = [
-                *[blob for blob in snapshot.primary if blob.key not in external_keys],
-                *snapshot.derived,
-                *snapshot.embedded,
+            # The role pins why each member is in the archive: current body
+            # references and owner-declared retirements are distinct recovery
+            # classes even when their content-hash names collide.
+            grouped: list[tuple[str, object]] = [
+                *[("primary", blob) for blob in snapshot.primary],
+                *[("derived", blob) for blob in snapshot.derived],
+                *[("embedded_current", blob) for blob in snapshot.embedded],
+                *[("embedded_retiring", blob) for blob in snapshot.retiring],
             ]
             backend = get_backend()
             provider_id = str(getattr(backend, "provider_id", backend.backend_name))
             transport = str(getattr(backend, "transport", backend.backend_name))
             entries: list[dict[str, str | int]] = []
             seen: set[str] = set()
-            for blob in blobs:
-                if blob.key in seen:
+            for role, raw_blob in grouped:
+                blob = raw_blob  # type: ignore[assignment]
+                if blob.key in seen:  # type: ignore[union-attr]
                     continue
-                seen.add(blob.key)
-                _archive_format_module._validate_restore_key(blob.key)
+                seen.add(blob.key)  # type: ignore[union-attr]
+                _archive_format_module._validate_restore_key(blob.key)  # type: ignore[union-attr]
                 try:
-                    size = backend.stat_size(blob.key)
+                    size = backend.stat_size(blob.key)  # type: ignore[union-attr]
                 except FileNotFoundError:
                     # Every entry from ``snapshot.derived`` is a rebuildable
                     # projection, including immutable thumbnail generations
@@ -209,31 +223,38 @@ def _manifest_blobs(snapshot_path: Path) -> list[dict[str, str | int]]:
                     # resource-type strings that drifts when a derivative is
                     # added. A key also claimed by a primary/embedded resource
                     # remains mandatory.
-                    if blob.key not in rebuildable_keys:
+                    if blob.key not in rebuildable_keys:  # type: ignore[union-attr]
                         raise
                     continue
                 digest = hashlib.sha256()
-                for chunk in backend.stream_chunks(blob.key):
+                for chunk in backend.stream_chunks(blob.key):  # type: ignore[union-attr]
                     digest.update(chunk)
-                namespace = backend.namespace_for(blob.key)
-                member = f"files/{len(entries):08d}-{Path(blob.key).name}"
-                entries.append(
-                    {
-                        "member": member,
-                        "arc": member,
-                        "key": blob.key,
-                        # ``provider`` is retained for v2 readers.  The
-                        # explicit provider/transport pair is the v3 identity
-                        # and prevents a generic backend name from hiding a
-                        # changed remote configuration.
-                        "provider": backend.backend_name,
-                        "provider_id": provider_id,
-                        "transport": transport,
-                        "namespace": namespace,
-                        "size": size,
-                        "sha256": digest.hexdigest(),
-                    }
-                )
+                namespace = backend.namespace_for(blob.key)  # type: ignore[union-attr]
+                member = f"files/{len(entries):08d}-{Path(blob.key).name}"  # type: ignore[union-attr]
+                entry: dict[str, str | int] = {
+                    "member": member,
+                    "arc": member,
+                    "key": blob.key,  # type: ignore[union-attr]
+                    # ``provider`` is retained for v2 readers.  The
+                    # explicit provider/transport pair is the v3 identity
+                    # and prevents a generic backend name from hiding a
+                    # changed remote configuration.
+                    "provider": backend.backend_name,
+                    "provider_id": provider_id,
+                    "transport": transport,
+                    "namespace": namespace,
+                    "size": size,
+                    "sha256": digest.hexdigest(),
+                    "role": role,
+                }
+                if role in {"embedded_current", "embedded_retiring"}:
+                    entry["image_owner_kind"] = (
+                        "document"
+                        if blob.resource_type == "document_image"
+                        else "collection"
+                    )
+                    entry["image_owner_id"] = blob.resource_id
+                entries.append(entry)
             return entries
     finally:
         engine.dispose()

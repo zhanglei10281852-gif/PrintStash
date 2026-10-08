@@ -29,6 +29,10 @@ Lanes
              (25,000 collections, 100,000 Models). Deep CI runs it nightly;
              every other lane deselects it. Deterministic scaling checks run
              in `pr` (tests/repo/test_read_scaling.py).
+  full-ordinary  full-suite tests without container resource markers.
+             A separate CI phase; includes slow tests.
+  full-resources full-suite container resource tests, serially.
+             A separate CI phase; each real service starts once.
   coverage   `full` under branch coverage, then the coverage gate: aggregate
              regression floor plus a per-module floor (tests/repo/test_coverage_floors.py).
              Writes term-missing, .coverage-html/index.html and coverage.json.
@@ -82,12 +86,14 @@ done
 # module-level state rely on the scheduling CI has historically exercised. The
 # default full/coverage lanes run container-backed contracts in a second, serial
 # pass so every service starts once rather than once per xdist worker.
+# Full-host native budget measurements also run serially: independent test
+# vaults do not share admission credits with the other xdist workers.
 parallel=(-n auto --dist worksteal)
 # A scale job runs one benchmark at a time. Four Deep CI matrix jobs provide
 # parallelism across runners; sharing one runner across seeded 100k-Model
 # databases exhausted the 30-minute job cap without a test result.
-resource_expression="postgres or s3 or remote_storage or bgcode"
-non_resource_expression="not postgres and not s3 and not remote_storage and not bgcode"
+resource_expression="postgres or s3 or remote_storage or bgcode or native_host"
+non_resource_expression="not postgres and not s3 and not remote_storage and not bgcode and not native_host"
 # Timed at the supported library size; only its own lane selects it.
 not_scale="not scale"
 
@@ -137,6 +143,14 @@ case "$lane" in
     fi
     uv run pytest "${parallel[@]}" -m "critical and not coverage_gate and $not_scale and $non_resource_expression" tests ${pytest_args[@]+"${pytest_args[@]}"}
     exec uv run pytest -m "critical and ($resource_expression)" tests ${pytest_args[@]+"${pytest_args[@]}"}
+    ;;
+  full-ordinary)
+    add_paths tests
+    exec uv run pytest "${parallel[@]}" -m "not coverage_gate and $not_scale and $non_resource_expression" ${lane_paths[@]+"${lane_paths[@]}"} ${pytest_args[@]+"${pytest_args[@]}"}
+    ;;
+  full-resources)
+    add_paths tests
+    exec uv run pytest -m "($resource_expression) and not coverage_gate and $not_scale" ${lane_paths[@]+"${lane_paths[@]}"} ${pytest_args[@]+"${pytest_args[@]}"}
     ;;
   full)
     add_paths tests

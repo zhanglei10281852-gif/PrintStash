@@ -1,0 +1,6 @@
+复盘验证记录
+1. SQLite 读取：rounds=589；Harness=Trae；effectiveRoundsEvidence.source=count-trae-cn-steps.py；scope=latest_turn；effectiveRounds=589；syncRevision=6。
+2. 代码工作树 HEAD=b6dfda1a42792bc040c84c17ba861bbbba334d99；模型改动集中在 embedded image ledger、documents/taxonomy、trash、storage、backup、audit、GC 和对应回归测试。
+3. 原始 Trae 轨迹 session-c5d5c86e13cf60ff.md 记录功能相关集合 1171 passed，最终分批 75 + 252 + 313 全部通过，ruff 全绿；其余失败被记录为 Windows/嵌套容器环境基线。
+4. 当前 Windows 直接 pytest 复跑被 backend/app/modules/ingestion/scratch_windows.py 的 fcntl 导入阻断；该阻断来自 Windows 运行时，不改写原始 Trae 测试结论。
+5. 代码审计沿正文更新→claims/retirement→trash/restore→backup/audit/GC→delete intent 链核对，未发现跨文档删除、重复 retirement 或未观察失败路径。

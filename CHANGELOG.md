@@ -1,6 +1,177 @@
 # Changelog
 
 ## Unreleased
+
+- Connect embedded markdown image references to a durable, recoverable lifecycle: edits record exact pending retirements in the body's own transaction (duplicate edits converge), startup and GC reconcile claims from bodies, backup manifests distinguish current/retiring images and same-named objects across namespaces, vault audit reports missing/retiring images and cross-document references with a reclaim repair, and permanent deletion releases only images no other document/collection references — with a final claim fence blocking physical cleanup when a reference reappears, and never deleting uploaded-but-unreferenced objects.
+
+- Add storage publication authority boundary tests for incompatible receipts and stale reconciliation.
+
+- Add import download contracts for staging names, redirect and window ceilings, stream cleanup and ZIP CRC refusal.
+
+- Add thumbnail engine contracts for unavailable allocation, source files and RSS telemetry, preserving publication errors.
+
+- Add real database contracts for mesh continuation recovery, cache lease deferral and current Job withdrawal authority.
+
+- Add authenticated HTTP contracts for outliner printer-filter authority and contradictory query scopes.
+
+- Add real ZIP preview contracts for embedded 3MF budgets, unsafe member names, CRC recovery and strict PNG validation.
+
+- Add real database contracts for similarity ingestion continuation authority, durable analysis eligibility and caller write rollback.
+
+- Verify fingerprint publication preserves active caller transactions and leases,
+  rejecting detached authority, changed recipes and invalid descriptor metadata.
+
+- Verify STL publication readers preserve buffered byte semantics and cancellation,
+  refusing nonregular output and unavailable or mismatched source storage.
+
+- Verify local inference rejects missing capabilities, model assets and oversized
+  input while preserving admission recovery and read-only cached model support.
+
+- Verify viewer STL conversion refuses nonfinite facets, excess streamed output
+  and changed or missing source identities before reporting success.
+
+- Verify prepared mesh resource identity and immutable detached buffers refuse
+  incoherent evidence before native analysis.
+
+- Verify import resolver selection identities reject malformed provider responses
+  while preserving stable errors and redacting private transport data.
+
+- Verify durable ingestion receipt writer authority, result pagination and canonical
+  File confirmation through real SQLite contracts.
+
+- Verify batch session lifecycle, frozen snapshots and result context against
+  real durable receipts, including refusal of incomplete artifact commit results.
+
+- Verify retained scene measurements preserve finite dimensions when closed
+  resources collapse or numeric volume aggregation exceeds its representable range.
+
+- Verify mesh output frame boundaries reject malformed flags, incoherent evidence,
+  oversized payloads and invalid fingerprint records before publication.
+
+- Verify preparation resource lifecycle rejects malformed recovery identities,
+  preserves failed cleanup ownership and enforces source-before-native ordering.
+
+- Verify durable volume evidence reads preserve closed variants and refuse
+  incompatible scalar, method, cause or state combinations.
+
+- Verify search generation proposal provider, visual profile and aggregation
+  rejection contracts directly at the public schema boundary.
+
+- Measure whole-host native fairness in the mandatory serial resource phase,
+  retaining real workers, branch coverage and the existing timing budgets.
+
+- Isolate provider HTTP pools and host capacity between tests so a previous
+  test's ended event loop cannot affect transport shutdown.
+
+- Keep fairness qualification reads bounded to pending foreground uploads while
+  preserving exact progress totals, native budgets and its existing deadline.
+
+- Qualify backup recovery and exact deletion against versioned S3 generations;
+  verify that missing receipts on unversioned targets are refused without
+  changing the published archive.
+
+- Reset PostgreSQL work-engine state by removing only its DBOS schema, preserving
+  application tables in the shared database and rebuilding the reconciler schedule.
+
+- Run Python compatibility tests and external service contracts in independent
+  Deep CI jobs, preserving both required results and their execution limits.
+
+- Distinguish repeated uploads from same-Job retries in sustained ingestion
+  qualification, verify versioned Artifact identities, and stop after the first
+  failed mandatory control while preserving failure evidence. Configure E2E
+  SQLite connections before concurrent work starts, matching production WAL
+  initialization and native-extension startup; prepare backup recovery through
+  permanent purge with foreign-key enforcement intact.
+
+- Keep Model card tag and similarity badge reads bounded as the SQLite catalog grows, including
+  installations with stale query-planner statistics.
+
+- Defer parent-only metrics and database URL parsing in disposable mesh workers,
+  reducing measured small-model startup costs while preserving CPU outputs,
+  parent telemetry and guarded process cleanup.
+
+- Add isolated GLB/LOD qualification tools with supervised native exports, real
+  browser memory/draw/quality measurements and protected-feature checks. Retain
+  STL after measured candidate correctness, resource and performance limits.
+
+- Publish batch Artifacts before materializing later entries. Bound disposable
+  staging by files and bytes, record each entry with its Artifact transaction,
+  and resume confirmed entries without reopening their sources. Keep partial
+  failures retryable and report unknown totals until discovery finishes.
+
+- Stop withdrawn batch imports between entries and source blocks, preserving
+  committed Artifacts and durable upload sources while cleaning owned staging.
+  Copy and hash browser upload bytes in one pass, and preserve cancellation when
+  receipt cleanup fails.
+
+- Add an isolated prepared-geometry cache benchmark with bounded, checksummed
+  arrays, current-loader STL equivalence checks and supervised worker timings.
+  Keep production preparation unchanged pending demonstrated reuse and recovery
+  guarantees.
+
+- Publish viewer STL conversions from verified staged streams without buffering
+  whole outputs in the API/worker parent. Reserve expanded output space before
+  conversion, reject changed or incomplete publications, and release request
+  database connections before work hints so concurrent viewer misses share one
+  durable conversion without pool timeouts. Release native compute credits before
+  storage publication; viewer recipe 3 rejects malformed STL and float32 overflow
+  or collapsed faces, rebuilding older viewer outputs on demand.
+
+- Bound file acceptance commands independently of ordinary API workers. Keep SQL
+  sessions on their creating thread, release them while streamed bodies wait,
+  revalidate credentials before publication, and finish admitted writes before
+  returning cancellation. Slow storage or engine hints leave lightweight API
+  requests responsive; accepted imports remain durable background Jobs.
+
+- Reserve interactive discovery slots beside one active backfill Job per
+  derivation lane. Keep bounded indexed scans and durable backfill progress
+  during uploads, dispatch admitted derivatives in FIFO order, and carry Job
+  priority through shared native and source-preparation admission with aging.
+  Preserve backfill reservations across public retries and engine-acceptance
+  crashes without spending another attempt while waiting. Verify legacy queue state before starting consumers; upgrades drain and
+  restart API and workers together.
+
+- Local ONNX models reserve a shared, bounded memory partition across API and worker processes, retain warm reuse, retire idle residents under pressure, and release their credits after guarded process-tree termination.
+
+**Source installs require Python 3.14 or newer.** See [the upgrade guide](UPGRADE.md#unreleased-python-314).
+
+- Coordinate mesh CPU/RAM credits across local API and worker processes. Bound
+  source preparation separately by bytes and I/O slots, retain native credits
+  through descendant cleanup, and recover abandoned source copies before reuse.
+  Reserve memory for the requested geometry, raster dimensions and optional
+  analysis, preserving WebP output and complete fingerprints for admitted work.
+  Reduce temporary raster buffers while keeping complete frames and output pixels.
+  Report queue time independently of native execution.
+- Remove the sidebar tree’s global 500-model limit with folder-scoped pages, complete branch counts, and global paginated name search with “Open location”. Keep permissions and library views in the server query; retry failed pages without losing loaded rows (#335).
+
+- Keep backup and vault audit clock inputs within valid minutes on Python 3.14; reject `24:00` rather than treating it as midnight.
+- Preserve traceable printer display names for extension-only and genuinely named inputs on Python 3.14.
+- Require Python 3.14 for the application and shared core, pin development and container runtimes to 3.14.8, and update the mesh stack to NumPy 2.5.3, SciPy 1.18.1 and Trimesh 5.1.1.
+- Publish mesh metadata and thumbnails before optional fingerprints finish, with durable bounded recovery that preserves completed outputs after native failures.
+- Reuse immutable mesh positions and smooth normals across each visual pass.
+  Embedding views and similarity view hashes consume pixels directly without
+  repeated PNG encoding and decoding, while preserving existing preview bytes
+  and descriptor identities.
+- Retain unique 3MF resources and explicit placements through measurement and
+  preview rendering. Measure repeated instances without first allocating a whole
+  placed mesh, materialize only for admitted fingerprints or global topology,
+  and release that mesh before rendering. Keep exact dimensions and counts when
+  optional volume or fingerprint analysis fails, with explicit volume evidence.
+  Preserve finite volume when source and placement scales compensate, and clear
+  measurement topology caches before rendering even without fingerprints.
+  Refresh mesh outputs under the new eligibility and budget policy.
+- Share bounded STL source validation across measurements, full loading, fallback
+  samples and streamed previews. Validate complete source facets and stable EOF
+  before reporting coverage, retain exact full-source bounds and counts for
+  partial samples, and refuse malformed or changed sources consistently.
+- Interpret reachable Core 3MF geometry and Production external model references
+  through an explicit bounded scene reader. Refuse unsupported required
+  capabilities with typed metadata, similarity and viewer reasons while retaining
+  original downloads and independently usable embedded previews. Refresh mesh
+  derivative recipes without introducing a Lib3MF dependency.
+- Keep mesh measurements and previews available when optional fingerprint analysis
+  exceeds its triangle budget, and release analysis buffers before STL rendering fallbacks.
+  Re-derive earlier terminal refusals at updated mesh recipes.
 - Independent mesh, G-code metadata/thumbnail and binary toolpath processing controls, with deployment defaults and live administrator settings. Disabling retains published previews and lets admitted processing finish; re-enabling resumes eligible missing work (#263).
 - Harden mesh workers with pre-import address-space limits, one admission controller
   across concurrency changes, process-tree memory accounting, and shared budgets
@@ -15,6 +186,20 @@ rolling back requires discarding the upgraded, disposable engine state first.
 See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
 
 ### Added
+
+- Measure mesh rendering, supervised native workers and upload-to-visible
+  production DBOS ingestion through separate reproducible benchmark paths.
+  Preserve phase costs, resource observations and failed samples, with an expanded
+  versioned corpus and opt-in large inputs and hash-pinned real slicer projects.
+- Publish explicit mesh volume state, method and cause independently of similarity
+  fingerprints. Preserve historical scalar provenance, keep small measurements
+  unrounded and evaluate signed volume accurately across large translations.
+  Reject nonphysical dimensions before publication and repair unusable historical
+  measurements during the additive upgrade.
+
+- Add a frozen synthetic mesh contract corpus and record benchmark environment, limits, versions and target expectations separately from observed render results.
+
+- Mesh workers retain bounded phase costs and parent-observed resource usage in structured process logs and local Prometheus counters, including metadata-only work and failed or cancelled native processes.
 
 - Deep CI exercises the production mesh pipeline under 1 GiB and 4 GiB
   limits on amd64 and arm64, publishing memory, failure and cleanup evidence.
@@ -35,6 +220,41 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
   will be removed in 0.16.
 
 ### Fixed
+
+- Bounded STL previews report whether all source triangles are represented independently from a complete source scan. Mesh processing now uses separate admission, loading, measurement and preview owners with validated geometry and fingerprint contracts.
+- Mesh workers reject unknown or malformed fingerprint result states before publication.
+- Capture and similarity commands keep the API event loop responsive through database writes, background-engine notification and response projection.
+- Preserve existing paired Point model manifests and native encoder alignment when mesh rendering recipes change. Visual vector caches still track their rendering recipe.
+- Mesh metadata preserves measurement precision, including submillimeter dimensions and small positive volumes; existing rounded measurements are recalculated.
+- Small meshes placed far from the coordinate origin retain their thumbnail
+  geometry and shading. Visual recipes now refresh previews, view fingerprints,
+  and derived image vectors while preserving original files and encoder assets.
+- Geometric verification reuses an exact point index and preserves nearest-point
+  distances for models placed far from the origin. Previous pair proofs are
+  rechecked under the new verifier recipe while retaining review decisions.
+- Ingest acceptance keeps the API event loop responsive while staging files,
+  recording work and notifying the background engine.
+
+- Keep mesh-worker memory limits and cancellation active after the child closes its reply stream.
+- Active mesh workers can release their render admission while a queued worker checks durable cancellation state.
+
+
+- The thumbnail benchmark now runs the real engine, measures persisted local thumbnail reads, and preserves failed attempts with their costs instead of reporting misleading cache timings.
+- Large STL files now retain complete bounding dimensions and facet counts when only metadata is requested; measurements no longer depend on producing a thumbnail.
+- Mesh previews and image embeddings ignore vertices unused by any face when
+  framing the surface. Existing visual derivatives are regenerated.
+- Meshes with repeated identical faces no longer expand the same thumbnail pixels
+  repeatedly, avoiding unnecessary rasterization work during ingestion.
+- Meshes with inconsistent triangle winding now report unknown volume while
+  retaining dimensions and triangle counts. Existing metadata is recalculated
+  automatically.
+- Browser-local upload queues recover as interrupted after a reload, so stale
+  tasks can be cleared. Resumable uploads retain their recovery controls, and
+  queued browser work now asks users to keep the tab open (#336).
+- 3D viewer conversions run as durable, on-demand Jobs. Requests share preparation
+  and retain failure reasons; memory refusals show a clear message while original
+  downloads and slicer handoff stay available. Hovering a model card no longer
+  starts a mesh conversion (#259).
 - Containers start with read-only Library source mounts beneath `/data`. Startup
   ownership repair is limited to app-owned directories and preserves external
   sources, including bind mounts on the same filesystem (#330).
@@ -44,6 +264,7 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
 
 - Background work starts on DBOS 3.0, with a persistent reconciler schedule
   that survives process restarts and is recreated after restore.
+- Late derivative results can no longer overwrite cancellation, retries, regeneration, trashed Artifacts or replaced source bytes. Stale Job executions also cannot settle a newer attempt or reclaim its staging files.
 
 
 - Removed the duplicate Wiki entry from the profile dropdown.
@@ -106,8 +327,25 @@ See [the upgrade guide](UPGRADE.md#unreleased-dbos-30).
 - Restoring a backup no longer fails because a completed ZIP inspection is
   waiting for file selection. Its staged archive remains available; unfinished
   uploads and imports still block restore until they are settled.
+- Large STL previews frame every source component and preserve ASCII geometry after large translations.
+
+- Streamed STL previews preserve valid oblique facets that the degeneracy filter could discard.
+
+- Serialize storage adoption and retirement by immutable reservation generation;
+  retain exact cleanup revocations and preserve newer objects at reused keys.
+  S3 backup deletion now requires an immutable object version. Failed commit
+  acknowledgements preserve already adopted covers, documents and embedded images.
+- Import completion prepares private source-cover candidates and switches their
+  visible pointer only under the current Job and Inbox authority.
+- Interrupted downloads, archive extraction and local copies retain exact cleanup
+  receipts and disk reservations; restart or retry reclaims their private workspaces
+  before the next input is admitted.
+- Recover maintenance capacity when a process dies after committing a Job result
+  but before its engine execution finishes, preserving the completed outcome.
 
 ### Performance
+
+- Convex hull descriptors use normalized SciPy/Qhull geometry, preserving dense convex surfaces and finite extreme scales while rejecting invalid coordinates. Existing fingerprints are recalculated.
 
 - Tag counts now follow collection links when inheriting tags, so listing tags
   stays responsive in libraries with tens of thousands of collections and

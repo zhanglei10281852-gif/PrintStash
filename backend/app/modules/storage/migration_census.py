@@ -67,10 +67,19 @@ def census(
 ) -> list[MigrationBlob]:
     snapshot = ownership_snapshot(session, discover=False, backend=source)
     result: dict[str, MigrationBlob] = {}
-    for group in (snapshot.primary, snapshot.derived, snapshot.embedded):
+    for group in (
+        snapshot.primary,
+        snapshot.derived,
+        snapshot.embedded,
+        snapshot.retiring,
+    ):
         for blob in group:
             if not source.exists(blob.key):
-                if group is snapshot.primary or group is snapshot.embedded:
+                if (
+                    group is snapshot.primary
+                    or group is snapshot.embedded
+                    or group is snapshot.retiring
+                ):
                     raise ValueError("migration_source_object_missing")
                 continue
             result[blob.key] = MigrationBlob(

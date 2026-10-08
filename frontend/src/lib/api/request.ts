@@ -60,6 +60,16 @@ export async function getAuthenticatedBlob(path: string): Promise<Blob> {
   return res.blob();
 }
 
+/** A published binary derivative, or its pending preparation state. */
+export type DerivedBlob = { ready: true; blob: Blob } | { ready: false };
+
+export async function getDerivedBlob(path: string, signal?: AbortSignal): Promise<DerivedBlob> {
+  const response = await fetchArtifact(path, signal);
+  if (!response.ok) throw await parseError(response);
+  if (response.status === 202) return { ready: false };
+  return { ready: true, blob: await response.blob() };
+}
+
 /** Read a protected text resource while preserving the shared 401 handling. */
 export async function getAuthenticatedText(path: string, signal?: AbortSignal): Promise<string> {
   const res = await fetchArtifact(path, signal);
@@ -287,13 +297,15 @@ if (isBrowser()) {
 }
 
 export interface GetJsonOptions {
+  signal?: AbortSignal;
   /** Bypass the in-memory cache (polling endpoints, explicit refresh). */
   fresh?: boolean;
 }
 
 export async function getJson<T>(path: string, options?: GetJsonOptions): Promise<T> {
-  if (!isBrowser() || options?.fresh) {
+  if (!isBrowser() || options?.fresh || options?.signal) {
     const res = await fetch(getUrl(path), {
+      signal: options?.signal,
       headers: authHeaders(),
       cache: "no-store",
     });

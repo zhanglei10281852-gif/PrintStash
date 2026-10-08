@@ -39,6 +39,7 @@ function aDocument(over: Partial<DocumentRead> = {}): DocumentRead {
     effective_role: "edit",
     updated_at: "2026-01-01T00:00:00Z",
     body: "# Notes",
+    images: [],
     ...over,
   };
 }

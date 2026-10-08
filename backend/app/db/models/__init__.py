@@ -39,6 +39,12 @@ from .capacity import CapacityLock as CapacityLock
 from .capacity import CapacityReservation as CapacityReservation
 from .capacity import StorageInventorySample as StorageInventorySample
 from .captions import SubjectCaption as SubjectCaption
+from .embedded_images import (
+    EmbeddedImageClaim as EmbeddedImageClaim,
+)
+from .embedded_images import (
+    EmbeddedImageRetirement as EmbeddedImageRetirement,
+)
 from .identity import (
     ApiKey as ApiKey,
 )
@@ -84,12 +90,14 @@ from .ingestion import (
 from .ingestion import (
     InboxItemResult as InboxItemResult,
 )
+from .ingestion import IngestionEntry as IngestionEntry
 from .ingestion import (
     IngestRequest as IngestRequest,
 )
 from .ingestion import (
     StagingLease as StagingLease,
 )
+from .ingestion_scratch import IngestionScratchWindow as IngestionScratchWindow
 from .library import (
     ArtifactMaterialRequirement as ArtifactMaterialRequirement,
 )
@@ -156,6 +164,7 @@ from .media import (
 from .media import (
     DerivativeRegeneration as DerivativeRegeneration,
 )
+from .media import MeshFingerprintContinuation as MeshFingerprintContinuation
 from .notifications import (
     NotificationChannel as NotificationChannel,
 )
@@ -270,6 +279,7 @@ from .storage import (
 from .storage import (
     StorageFailureDomainDeclaration as StorageFailureDomainDeclaration,
 )
+from .storage import StoragePublicationLocator as StoragePublicationLocator
 from .types import (
     SENTINEL_FILE_HASH as SENTINEL_FILE_HASH,
 )
@@ -302,6 +312,12 @@ from .types import (
     DocumentKind as DocumentKind,
 )
 from .types import (
+    EmbeddedImageOwnerKind as EmbeddedImageOwnerKind,
+)
+from .types import (
+    EmbeddedImageRetirementState as EmbeddedImageRetirementState,
+)
+from .types import (
     ExternalLibraryCollectionMode as ExternalLibraryCollectionMode,
 )
 from .types import (
@@ -331,6 +347,7 @@ from .types import (
 from .types import (
     InboxSourceKind as InboxSourceKind,
 )
+from .types import IngestionEntryState as IngestionEntryState
 from .types import (
     IngestRequestKind as IngestRequestKind,
 )

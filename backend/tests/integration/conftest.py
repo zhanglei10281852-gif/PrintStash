@@ -46,8 +46,11 @@ from tests.factories.protocols import (
     MakeInboxItem,
     MakeIndexGeneration,
     MakeInferenceEndpoint,
+    MakeIngestionScratchWindow,
     MakeIngestRequest,
     MakeJob,
+    MakeMeshContinuation,
+    MakeMetadata,
     MakeModel,
     MakeMultipartBuild,
     MakeMultipartBuildAttempt,
@@ -79,6 +82,7 @@ from tests.factories.protocols import (
     MakeSimilarityObservation,
     MakeSimilarityRun,
     MakeStorageConnection,
+    MakeStoragePublicationLocator,
     MakeSubjectCaption,
     MakeSystemConfig,
     MakeUser,
@@ -189,8 +193,8 @@ def make_file(db_session: Session) -> MakeFile:
 
 
 @pytest.fixture
-def make_metadata(db_session: Session) -> Any:
-    """Slicer/mesh metadata for one artifact; every field optional."""
+def make_metadata(db_session: Session) -> MakeMetadata:
+    """Slicer/mesh facts with coherent explicit volume evidence."""
     return _bound(factories.build_metadata, db_session)
 
 
@@ -319,6 +323,14 @@ def make_external_library(db_session: Session) -> MakeExternalLibrary:
 def make_document(db_session: Session) -> MakeDocument:
     """A document; the builder fills the field set matching its `kind`."""
     return _bound(factories.build_document, db_session)
+
+
+@pytest.fixture
+def make_storage_publication_locator(
+    db_session: Session,
+) -> MakeStoragePublicationLocator:
+    """The stable anchor shared by every publication at a storage locator."""
+    return _bound(factories.build_storage_publication_locator, db_session)
 
 
 @pytest.fixture
@@ -473,11 +485,13 @@ __all__ = [
     "MakeDocument",
     "MakeExternalLibrary",
     "MakeFile",
+    "MakeMetadata",
     "MakeInboxItem",
     "MakeModel",
     "MakeMultipartModel",
     "MakeMultipartModelStar",
     "MakeOwnedStorageObject",
+    "MakeStoragePublicationLocator",
     "MakePrintJob",
     "MakePrinter",
     "MakePrinterFile",
@@ -505,6 +519,7 @@ __all__ = [
     "make_audit_finding",
     "make_audit_run",
     "make_derivative",
+    "make_mesh_continuation",
     "make_ingest_request",
     "make_job",
     "make_work_executor",
@@ -525,6 +540,7 @@ __all__ = [
     "make_multipart_model_star",
     "make_notification_channel",
     "make_owned_storage_object",
+    "make_storage_publication_locator",
     "make_print_job",
     "make_printer",
     "make_printer_file",
@@ -741,3 +757,14 @@ def make_search_projection_request(db_session: Session) -> MakeSearchProjectionR
 
 
 __all__ += ["make_search_projection_request"]
+
+
+@pytest.fixture
+def make_mesh_continuation(db_session: Session) -> MakeMeshContinuation:
+    """Pending optional mesh analysis with a canonical current source snapshot."""
+    return _bound(factories.build_mesh_continuation, db_session)
+
+
+@pytest.fixture
+def make_ingestion_scratch_window(db_session: Session) -> MakeIngestionScratchWindow:
+    return _bound(factories.build_ingestion_scratch_window, db_session)

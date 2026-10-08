@@ -167,6 +167,25 @@ against current configuration and committed ownership before full verification.
 
 ### Storage
 
+**Embedded image claim**:
+A durable record that one markdown body (a document or a collection readme)
+currently references an image in an owner namespace
+(`/api/v1/documents/{id}/images/{name}` or the collection equivalent). Claims
+are derived from body text and reconvergeable: edits commit them with the body,
+and restart reconciliation repairs them from the bodies. A claim whose
+referrer differs from the owner is a cross-namespace reference and protects the
+exact bytes from the owner's purge.
+
+**Pending image retirement**:
+The observable state an image enters when its precise owner removes its
+self-reference in a body edit. Retirement is recorded as the exact removal
+set, in the body's transaction; the bytes stay owned, backed up and served,
+and re-referencing the image reclaims the retirement. Physical release happens
+only when the owner is permanently deleted and no other referrer claim exists.
+An uploaded image that never appeared in a body has no claim and no
+retirement, preserving the historical "never delete discovered objects"
+behavior.
+
 **Storage target identity**:
 The versioned identity of the service and container holding bytes, distinct
 from an object's locator, ownership receipt, or connection profile.

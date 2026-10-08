@@ -6,6 +6,47 @@ import type {
   ReproducibilityLevel,
 } from "./printers";
 
+/** Volume evidence uses cubic millimetres; legacy values carry no topology proof. */
+export type VolumeMeasurement =
+  | {
+      state: "measured";
+      unit: "mm3";
+      method: "mesh_surface_integral";
+      value_mm3: number;
+      cause: null;
+    }
+  | {
+      state: "unavailable";
+      unit: "mm3";
+      method: "mesh_surface_integral";
+      value_mm3: null;
+      cause:
+        | "not_watertight"
+        | "inconsistent_winding"
+        | "non_positive_integral"
+        | "nonfinite_integral"
+        | "measurement_failed";
+    }
+  | {
+      state: "not_calculated";
+      unit: "mm3";
+      method: null;
+      value_mm3: null;
+      cause:
+        | "enrichment_pending"
+        | "not_applicable"
+        | "not_requested"
+        | "geometry_unavailable"
+        | "topology_not_evaluated";
+    }
+  | {
+      state: "legacy_unassessed";
+      unit: "mm3";
+      method: null;
+      value_mm3: number | null;
+      cause: null;
+    };
+
 export interface MetadataRead {
   slicer_name: string | null;
   slicer_version: string | null;
@@ -30,6 +71,7 @@ export interface MetadataRead {
   bbox_y_mm: number | null;
   bbox_z_mm: number | null;
   volume_mm3: number | null;
+  volume_measurement: VolumeMeasurement;
   triangle_count: number | null;
 }
 
@@ -409,6 +451,7 @@ export type JobKind =
   | "derivatives.gcode"
   | "derivatives.mesh"
   | "derivatives.toolpath"
+  | "derivatives.viewer_stl"
   | "identity.retention"
   | "inference.model_download"
   | "ingestion.archive_inspect"
@@ -423,6 +466,7 @@ export type JobKind =
   | "ingestion.upload_recovery"
   | "ingestion.url"
   | "ingestion.url_selection"
+  | "ingestion.scratch_cleanup"
   | "notifications.deliver"
   | "notifications.retention"
   | "printing.dispatch"
@@ -455,7 +499,7 @@ export type LaneName =
   | "similarity";
 
 /** An output derived from an Artifact's bytes: the backend's `DerivativeKind`. */
-export type DerivativeKind = "metadata" | "thumbnail" | "toolpath";
+export type DerivativeKind = "metadata" | "thumbnail" | "toolpath" | "viewer_stl";
 
 export type WorkPriority = "interactive" | "backfill";
 

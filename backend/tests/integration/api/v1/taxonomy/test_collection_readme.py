@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
+from app.api.v1 import taxonomy as taxonomy_router
 from app.core.config import _overlay
 from app.db.models import CollectionRole, User
 from app.modules.library import taxonomy
@@ -208,3 +212,147 @@ class TestHasReadme:
 
         assert renamed.status_code == 200, renamed.text
         assert renamed.json()["has_readme"] is True
+
+
+class TestReadmeEmbeddedImageLifecycle:
+    """Readme edits drive the same observable retirement lifecycle as docs."""
+
+    @staticmethod
+    def _upload(client: TestClient, headers: dict[str, str], collection_id: int):
+        response = client.post(
+            f"/api/v1/collections/{collection_id}/images",
+            files={"file": ("pic.png", _PNG, "image/png")},
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        url = response.json()["url"]
+        return url, url.rsplit("/", 1)[-1]
+
+    def test_removing_a_readme_image_marks_it_retiring(
+        self, db_session: Session, client: TestClient, tmp_path: Path
+    ) -> None:
+        collection, headers = _editable_collection(db_session, tmp_path)
+        url, name = self._upload(client, headers, collection.id)
+        client.put(
+            f"/api/v1/collections/{collection.id}/readme",
+            json={"readme": f"![pic]({url})"},
+            headers=headers,
+        )
+
+        response = client.put(
+            f"/api/v1/collections/{collection.id}/readme",
+            json={"readme": "no image"},
+            headers=headers,
+        )
+
+        images = response.json()["images"]
+        assert [image["name"] for image in images] == [name]
+        assert images[0]["state"] == "retiring"
+        assert images[0]["removed_at"] is not None
+
+    def test_readding_the_image_reclaims_the_retirement(
+        self, db_session: Session, client: TestClient, tmp_path: Path
+    ) -> None:
+        collection, headers = _editable_collection(db_session, tmp_path)
+        url, name = self._upload(client, headers, collection.id)
+        for readme in (f"![pic]({url})", "no image"):
+            client.put(
+                f"/api/v1/collections/{collection.id}/readme",
+                json={"readme": readme},
+                headers=headers,
+            )
+
+        response = client.put(
+            f"/api/v1/collections/{collection.id}/readme",
+            json={"readme": f"![pic]({url})"},
+            headers=headers,
+        )
+
+        images = response.json()["images"]
+        assert images == [{"name": name, "state": "current", "removed_at": None}]
+
+    def test_a_viewer_reads_the_image_states(
+        self, db_session: Session, client: TestClient, tmp_path: Path
+    ) -> None:
+        collection, headers = _editable_collection(db_session, tmp_path)
+        url, name = self._upload(client, headers, collection.id)
+        client.put(
+            f"/api/v1/collections/{collection.id}/readme",
+            json={"readme": f"![pic]({url})"},
+            headers=headers,
+        )
+        viewer = build_user(db_session, "readme-viewer")
+        _grant(db_session, viewer, collection.id, CollectionRole.VIEW)
+
+        response = client.get(
+            f"/api/v1/collections/{collection.id}/readme",
+            headers=bearer(viewer),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["images"] == [
+            {"name": name, "state": "current", "removed_at": None}
+        ]
+
+
+class TestCollectionImageExecution:
+    @pytest.mark.asyncio
+    async def test_owns_upload_sessions(
+        self, app, db_session, auth_headers, make_collection
+    ):
+        from threading import get_ident
+
+        from app.db.session import get_session_factory, override_session_factory
+        from tests.fakes.thread_sessions import ThreadBoundSessionFactory
+
+        collection = make_collection("Image boundary")
+        factory = ThreadBoundSessionFactory(db_session.get_bind())
+        previous = get_session_factory()
+        override_session_factory(factory)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/api/v1/collections/{collection.id}/images",
+                    headers=auth_headers,
+                    files={"file": ("pic.png", _PNG, "image/png")},
+                )
+        finally:
+            override_session_factory(previous)
+        assert response.status_code == 201, response.text
+        assert factory.opened_count > 0
+        assert factory.active_count == 0
+        assert get_ident() not in factory.thread_ids
+
+    @pytest.mark.asyncio
+    async def test_keeps_health_responsive_during_publication(
+        self, app, auth_headers, make_collection, monkeypatch
+    ):
+        collection = make_collection("Image boundary")
+        loop = asyncio.get_running_loop()
+        observations = []
+        publish = taxonomy_router.prepare_bytes
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+
+            def delayed_publication(*args, **kwargs):
+                health = asyncio.run_coroutine_threadsafe(
+                    client.get("/api/v1/health"), loop
+                )
+                try:
+                    observations.append(health.result(timeout=2).status_code)
+                except TimeoutError:
+                    health.cancel()
+                    observations.append(None)
+                return publish(*args, **kwargs)
+
+            monkeypatch.setattr(taxonomy_router, "prepare_bytes", delayed_publication)
+            response = await client.post(
+                f"/api/v1/collections/{collection.id}/images",
+                headers=auth_headers,
+                files={"file": ("pic.png", _PNG, "image/png")},
+            )
+        assert response.status_code == 201, response.text
+        assert observations == [200]

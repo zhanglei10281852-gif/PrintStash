@@ -9,7 +9,6 @@ Document blob appear unowned.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 from sqlmodel import Session, select
@@ -19,15 +18,16 @@ from app.db.models import (
     ArtifactDerivative,
     Collection,
     Document,
+    EmbeddedImageOwnerKind,
+    EmbeddedImageRetirement,
+    EmbeddedImageRetirementState,
     File,
     ModelSourceCover,
     MultipartModel,
 )
+from app.modules.library.embedded_images import extract_refs
 from app.modules.storage.storage_backend.contracts import StorageBackend
 from app.modules.storage.storage_backend.runtime import get_backend
-
-_COLLECTION_IMAGE_RE = re.compile(r"/collections/(\d+)/images/([^\s)\]?#]+)")
-_DOCUMENT_IMAGE_RE = re.compile(r"/documents/(\d+)/images/([^\s)\]?#]+)")
 
 
 @dataclass(frozen=True)
@@ -40,21 +40,122 @@ class OwnedBlob:
     display_name: str | None = None
 
 
+@dataclass(frozen=True)
+class EmbeddedReference:
+    """One current cross-namespace reference: a referrer body embeds an image
+    living in a different owner namespace."""
+
+    owner_kind: EmbeddedImageOwnerKind
+    owner_id: int
+    name: str
+    referrer_kind: EmbeddedImageOwnerKind
+    referrer_id: int
+
+
 @dataclass
 class StorageOwnershipSnapshot:
     primary: list[OwnedBlob] = field(default_factory=list)
     external: list[OwnedBlob] = field(default_factory=list)
     derived: list[OwnedBlob] = field(default_factory=list)
+    # Images a current body references — by the owner itself or by another
+    # document/collection. Removing the reference moves the image to
+    # ``retiring``; neither list is derived from storage discovery.
     embedded: list[OwnedBlob] = field(default_factory=list)
+    # Images an owner explicitly removed via a precise body edit. They stay
+    # owned and recoverable until the precise owner is permanently deleted.
+    retiring: list[OwnedBlob] = field(default_factory=list)
+    cross_references: list[EmbeddedReference] = field(default_factory=list)
+    # Content-hash image names appearing under two or more owner namespaces —
+    # physically distinct objects that backup/audit must never conflate.
+    shared_names: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     discovered_keys: set[str] = field(default_factory=set)
 
     @property
     def claimed_keys(self) -> set[str]:
         return {
             blob.key
-            for group in (self.primary, self.derived, self.embedded)
+            for group in (self.primary, self.derived, self.embedded, self.retiring)
             for blob in group
         }
+
+
+def _embedded_blob(
+    backend: StorageBackend,
+    owner_kind: EmbeddedImageOwnerKind,
+    owner_id: int,
+    name: str,
+) -> OwnedBlob:
+    if owner_kind is EmbeddedImageOwnerKind.DOCUMENT:
+        key = backend.document_image_key(owner_id, name)
+        resource_type = "document_image"
+    else:
+        key = backend.collection_image_key(owner_id, name)
+        resource_type = "collection_image"
+    return OwnedBlob(
+        key=key, resource_type=resource_type, resource_id=owner_id, display_name=name
+    )
+
+
+def _collect_embedded(
+    backend: StorageBackend,
+    documents: list[Document],
+    collections: list[Collection],
+) -> tuple[
+    list[OwnedBlob],
+    list[EmbeddedReference],
+    dict[str, list[tuple[str, int]]],
+]:
+    """Current image references from every body, including cross-namespace ones.
+
+    Returns the distinct owned blobs, the cross-namespace references, and the
+    names shared across owner namespaces.
+    """
+    referrers: tuple[tuple[EmbeddedImageOwnerKind, int, str | None], ...] = tuple(
+        (EmbeddedImageOwnerKind.DOCUMENT, int(row.id), row.body)
+        for row in documents
+        if row.id is not None
+    ) + tuple(
+        (EmbeddedImageOwnerKind.COLLECTION, int(row.id), row.readme)
+        for row in collections
+        if row.id is not None
+    )
+    current: dict[
+        tuple[EmbeddedImageOwnerKind, int, str],
+        set[tuple[EmbeddedImageOwnerKind, int]],
+    ] = {}
+    for referrer_kind, referrer_id, text in referrers:
+        for ref in extract_refs(text):
+            current.setdefault(
+                (ref.owner_kind, ref.owner_id, ref.name), set()
+            ).add((referrer_kind, referrer_id))
+
+    embedded: list[OwnedBlob] = []
+    cross_references: list[EmbeddedReference] = []
+    owners_by_name: dict[str, set[tuple[EmbeddedImageOwnerKind, int]]] = {}
+    for (owner_kind, owner_id, name), referees in sorted(
+        current.items(), key=lambda item: (item[0][0].value, item[0][1], item[0][2])
+    ):
+        embedded.append(_embedded_blob(backend, owner_kind, owner_id, name))
+        owners_by_name.setdefault(name, set()).add((owner_kind, owner_id))
+        for referrer_kind, referrer_id in sorted(
+            referees, key=lambda item: (item[0].value, item[1])
+        ):
+            if referrer_kind is not owner_kind or referrer_id != owner_id:
+                cross_references.append(
+                    EmbeddedReference(
+                        owner_kind=owner_kind,
+                        owner_id=owner_id,
+                        name=name,
+                        referrer_kind=referrer_kind,
+                        referrer_id=referrer_id,
+                    )
+                )
+    shared_names = {
+        name: sorted((kind.value, owner_id) for kind, owner_id in owners)
+        for name, owners in owners_by_name.items()
+        if len(owners) >= 2
+    }
+    return embedded, cross_references, shared_names
 
 
 def ownership_snapshot(
@@ -152,30 +253,28 @@ def ownership_snapshot(
                     display_name=row.filename,
                 )
             )
-        for doc_id, name in _DOCUMENT_IMAGE_RE.findall(row.body or ""):
-            if int(doc_id) == row.id:
-                result.embedded.append(
-                    OwnedBlob(
-                        key=backend.document_image_key(row.id, name),
-                        resource_type="document_image",
-                        resource_id=row.id,
-                        display_name=name,
-                    )
-                )
+    collections = list(session.exec(select(Collection)).all())
+    embedded, cross_references, shared_names = _collect_embedded(
+        backend, documents, collections
+    )
+    result.embedded = embedded
+    result.cross_references = cross_references
+    result.shared_names = shared_names
 
-    for row in session.exec(select(Collection)).all():
-        if row.id is None:
-            continue
-        for collection_id, name in _COLLECTION_IMAGE_RE.findall(row.readme or ""):
-            if int(collection_id) == row.id:
-                result.embedded.append(
-                    OwnedBlob(
-                        key=backend.collection_image_key(row.id, name),
-                        resource_type="collection_image",
-                        resource_id=row.id,
-                        display_name=name,
-                    )
-                )
+    # Pending retirements are still owned: backed up, audited and claimed, so
+    # discovery can never call the bytes unowned. A retirement stays visible
+    # even when another referrer currently embeds the image — that is exactly
+    # the case where purge preserves the bytes and an operator needs to see
+    # why. Rows whose owner was hard-deleted are included by deterministic key
+    # so post-purge protection evidence stays visible.
+    for row in session.exec(
+        select(EmbeddedImageRetirement).where(
+            EmbeddedImageRetirement.state == EmbeddedImageRetirementState.PENDING
+        )
+    ).all():
+        result.retiring.append(
+            _embedded_blob(backend, row.owner_kind, row.owner_id, row.name)
+        )
 
     # Provenance covers are vault-owned blobs even though they are not attached
     # to a File.  Keep them in the census so backup/restore cannot silently lose
@@ -221,9 +320,9 @@ def all_owned_blob_keys(session: Session) -> set[str]:
     Trashed rows are included on purpose: their bytes must survive until the
     row is hard-deleted, otherwise restoring from trash yields an empty file.
 
-    Includes derived and embedded keys for backup/audit completeness. External
-    paths remain included for compatibility even though their bytes are always
-    user-owned.
+    Includes derived, embedded and retiring keys for backup/audit completeness.
+    External paths remain included for compatibility even though their bytes
+    are always user-owned.
     """
     snapshot = ownership_snapshot(session, discover=False)
     # Compatibility contract: external File.path values historically appeared

@@ -13,16 +13,19 @@ can change, and only a superuser can purge a trashed document for good.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from app.api.command_actor import CommandActor
 from app.api.v1 import documents as documents_router
 from app.core.config import _overlay
 from app.db.models import CollectionRole, Document, User
@@ -394,8 +397,7 @@ class TestUploadDocument:
                 name=None,
                 collection_id=None,
                 multipart_model_id=None,
-                current_user=admin,
-                session=db_session,
+                actor=CommandActor.from_user(admin),
             )
 
         assert raised.value.status_code == 413
@@ -417,8 +419,7 @@ class TestUploadDocument:
                 name=None,
                 collection_id=None,
                 multipart_model_id=None,
-                current_user=admin,
-                session=db_session,
+                actor=CommandActor.from_user(admin),
             )
 
         assert raised.value.status_code == 413
@@ -441,8 +442,7 @@ class TestUploadDocument:
                 name=None,
                 collection_id=None,
                 multipart_model_id=None,
-                current_user=admin,
-                session=db_session,
+                actor=CommandActor.from_user(admin),
             )
 
         assert raised.value.status_code == 413
@@ -1036,8 +1036,7 @@ class TestUploadDocumentImage:
             await documents_router.upload_document_image(
                 document_id=doc["id"],
                 file=oversized,
-                current_user=admin,
-                session=db_session,
+                actor=CommandActor.from_user(admin),
             )
 
         assert raised.value.status_code == 413
@@ -1132,3 +1131,536 @@ class TestGetDocumentImage:
 
         assert response.status_code == 404, response.text
         assert response.json()["detail"] == "image_not_found"
+
+
+class TestEmbeddedImageLifecycle:
+    """Edit → observable pending retirement → re-reference/restore/purge."""
+
+    @staticmethod
+    def _upload_image(
+        client: TestClient,
+        headers: dict[str, str],
+        document_id: int,
+        data: bytes = _PNG,
+    ) -> tuple[str, str]:
+        response = client.post(
+            f"/api/v1/documents/{document_id}/images",
+            files={"file": ("pic.png", data, "image/png")},
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        url = response.json()["url"]
+        return url, url.rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _image_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {image["name"]: image for image in payload["images"]}
+
+    def test_create_records_an_embedded_reference_as_current(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        doc = markdown_doc("Plain")
+        _url, name = self._upload_image(client, admin_headers, doc["id"])
+
+        response = client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({_url})"},
+            headers=admin_headers,
+        )
+
+        images = self._image_map(response.json())
+        assert images[name]["state"] == "current"
+        assert images[name]["removed_at"] is None
+
+    def test_removing_a_reference_marks_the_image_retiring(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        doc = markdown_doc("Illustrated")
+        url_a, name_a = self._upload_image(client, admin_headers, doc["id"], _PNG)
+        url_b, name_b = self._upload_image(
+            client, admin_headers, doc["id"], b"different-image-bytes"
+        )
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![a]({url_a}) ![b]({url_b})"},
+            headers=admin_headers,
+        )
+
+        response = client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![b]({url_b})"},
+            headers=admin_headers,
+        )
+
+        images = self._image_map(response.json())
+        assert set(images) == {name_a, name_b}
+        assert images[name_a]["state"] == "retiring"
+        assert images[name_a]["removed_at"] is not None
+        assert images[name_b]["state"] == "current"
+
+    def test_a_duplicate_removal_records_a_single_retirement(
+        self,
+        client: TestClient,
+        db_session: Session,
+        admin_headers: dict[str, str],
+        markdown_doc,
+    ) -> None:
+        from app.db.models import EmbeddedImageRetirement
+
+        doc = markdown_doc("Illustrated")
+        url, name = self._upload_image(client, admin_headers, doc["id"])
+        body_without = "no image now"
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": body_without},
+            headers=admin_headers,
+        )
+
+        response = client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": body_without},
+            headers=admin_headers,
+        )
+
+        images = response.json()["images"]
+        assert [image["name"] for image in images] == [name]
+        assert images[0]["state"] == "retiring"
+        assert images[0]["removed_at"] is not None
+        db_session.expire_all()
+        rows = db_session.exec(select(EmbeddedImageRetirement)).all()
+        assert len(rows) == 1
+
+    def test_re_embedding_reclaims_the_retirement(
+        self,
+        client: TestClient,
+        db_session: Session,
+        admin_headers: dict[str, str],
+        markdown_doc,
+    ) -> None:
+        from app.db.models import EmbeddedImageRetirementState
+
+        doc = markdown_doc("Illustrated")
+        url, name = self._upload_image(client, admin_headers, doc["id"])
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": "gone"},
+            headers=admin_headers,
+        )
+
+        response = client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+
+        images = self._image_map(response.json())
+        assert images[name]["state"] == "current"
+        db_session.expire_all()
+        from app.db.models import EmbeddedImageRetirement
+
+        retirement = db_session.exec(
+            select(EmbeddedImageRetirement).where(
+                EmbeddedImageRetirement.name == name
+            )
+        ).one()
+        assert retirement.state is EmbeddedImageRetirementState.RECLAIMED
+
+    def test_a_retiring_image_still_serves_at_its_url(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        doc = markdown_doc("Illustrated")
+        url, _name = self._upload_image(client, admin_headers, doc["id"])
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": "removed"},
+            headers=admin_headers,
+        )
+
+        assert client.get(url, headers=admin_headers).content == _PNG
+
+    def test_a_failed_edit_leaves_body_claims_and_retirements_unchanged(
+        self,
+        client: TestClient,
+        db_session: Session,
+        admin_headers: dict[str, str],
+        markdown_doc,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from app.db.models import EmbeddedImageClaim, EmbeddedImageRetirement
+
+        doc = markdown_doc("Illustrated")
+        url, name = self._upload_image(client, admin_headers, doc["id"])
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+
+        def failing_commit(_session: Session) -> None:
+            raise RuntimeError("body update unavailable")
+
+        monkeypatch.setattr(Session, "commit", failing_commit)
+        with pytest.raises(RuntimeError, match="body update unavailable"):
+            client.put(
+                f"/api/v1/documents/{doc['id']}",
+                json={"body": "removed"},
+                headers=admin_headers,
+            )
+
+        db_session.expire_all()
+        persisted = db_session.get(Document, doc["id"])
+        assert persisted.body == f"![pic]({url})"
+        assert {row.name for row in db_session.exec(select(EmbeddedImageClaim)).all()} == {
+            name
+        }
+        assert db_session.exec(select(EmbeddedImageRetirement)).all() == []
+
+    def test_a_restored_document_keeps_serving_its_embedded_image(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        doc = markdown_doc("Illustrated")
+        url, _name = self._upload_image(client, admin_headers, doc["id"])
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+        client.delete(f"/api/v1/documents/{doc['id']}", headers=admin_headers)
+
+        assert (
+            client.post(
+                f"/api/v1/documents/{doc['id']}/restore", headers=admin_headers
+            ).status_code
+            == 200
+        )
+
+        assert client.get(url, headers=admin_headers).status_code == 200
+        assert client.get(url, headers=admin_headers).content == _PNG
+
+    def test_purge_removes_current_and_retiring_images_but_keeps_unreferenced(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        doc = markdown_doc("Illustrated")
+        url_a, name_a = self._upload_image(client, admin_headers, doc["id"], b"img-a")
+        url_b, name_b = self._upload_image(client, admin_headers, doc["id"], b"img-b")
+        _url_c, name_c = self._upload_image(
+            client, admin_headers, doc["id"], b"img-c"
+        )
+        backend = get_backend()
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![a]({url_a}) ![b]({url_b})"},
+            headers=admin_headers,
+        )
+        client.put(
+            f"/api/v1/documents/{doc['id']}",
+            json={"body": f"![a]({url_a})"},
+            headers=admin_headers,
+        )
+        client.delete(f"/api/v1/documents/{doc['id']}", headers=admin_headers)
+
+        purge = client.delete(
+            f"/api/v1/documents/{doc['id']}/permanent", headers=admin_headers
+        )
+
+        assert purge.status_code == 204, purge.text
+        assert not backend.exists(backend.document_image_key(doc["id"], name_a))
+        assert not backend.exists(backend.document_image_key(doc["id"], name_b))
+        # Uploaded but never embedded: default compatibility leaves it alone.
+        assert backend.exists(backend.document_image_key(doc["id"], name_c))
+
+    def test_purge_preserves_an_image_referenced_by_another_document(
+        self, client: TestClient, admin_headers: dict[str, str], markdown_doc
+    ) -> None:
+        owner = markdown_doc("Owner")
+        url, name = self._upload_image(client, admin_headers, owner["id"])
+        client.put(
+            f"/api/v1/documents/{owner['id']}",
+            json={"body": f"![pic]({url})"},
+            headers=admin_headers,
+        )
+        referrer = markdown_doc("Referrer")
+        client.put(
+            f"/api/v1/documents/{referrer['id']}",
+            json={"body": f"![theirs]({url})"},
+            headers=admin_headers,
+        )
+        backend = get_backend()
+        client.delete(f"/api/v1/documents/{owner['id']}", headers=admin_headers)
+
+        assert (
+            client.delete(
+                f"/api/v1/documents/{owner['id']}/permanent",
+                headers=admin_headers,
+            ).status_code
+            == 204
+        )
+
+        assert backend.exists(backend.document_image_key(owner["id"], name))
+
+
+class TestDocumentUploadExecution:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "filename,data,media_type",
+        [
+            ("guide.pdf", PDF_BYTES, "application/pdf"),
+            ("guide.md", b"# Guide", "text/markdown"),
+        ],
+    )
+    async def test_owns_upload_sessions(
+        self, app, db_session, admin_headers, filename, data, media_type
+    ):
+        from threading import get_ident
+
+        from app.db.session import get_session_factory, override_session_factory
+        from tests.fakes.thread_sessions import ThreadBoundSessionFactory
+
+        factory = ThreadBoundSessionFactory(db_session.get_bind())
+        previous = get_session_factory()
+        override_session_factory(factory)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    "/api/v1/documents/upload",
+                    headers=admin_headers,
+                    files={"file": (filename, data, media_type)},
+                )
+        finally:
+            override_session_factory(previous)
+        assert response.status_code == 201, response.text
+        assert factory.opened_count > 0
+        assert factory.active_count == 0
+        assert get_ident() not in factory.thread_ids
+
+    @pytest.mark.asyncio
+    async def test_keeps_health_responsive_during_publication(
+        self, app, admin_headers, monkeypatch
+    ):
+        loop = asyncio.get_running_loop()
+        observations = []
+        publish = documents_router.prepare_stream
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+
+            def delayed_publication(*args, **kwargs):
+                health = asyncio.run_coroutine_threadsafe(
+                    client.get("/api/v1/health"), loop
+                )
+                try:
+                    observations.append(health.result(timeout=2).status_code)
+                except TimeoutError:
+                    health.cancel()
+                    observations.append(None)
+                return publish(*args, **kwargs)
+
+            monkeypatch.setattr(documents_router, "prepare_stream", delayed_publication)
+            response = await client.post(
+                "/api/v1/documents/upload",
+                headers=admin_headers,
+                files={"file": ("guide.pdf", PDF_BYTES, "application/pdf")},
+            )
+        assert response.status_code == 201, response.text
+        assert observations == [200]
+
+
+class TestDocumentImageExecution:
+    @pytest.mark.asyncio
+    async def test_owns_upload_sessions(
+        self, app, db_session, admin_headers, make_document
+    ):
+        from threading import get_ident
+
+        from app.db.session import get_session_factory, override_session_factory
+        from tests.fakes.thread_sessions import ThreadBoundSessionFactory
+
+        doc = make_document("Illustrated")
+        factory = ThreadBoundSessionFactory(db_session.get_bind())
+        previous = get_session_factory()
+        override_session_factory(factory)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/api/v1/documents/{doc.id}/images",
+                    headers=admin_headers,
+                    files={"file": ("pic.png", _PNG, "image/png")},
+                )
+        finally:
+            override_session_factory(previous)
+        assert response.status_code == 201, response.text
+        assert factory.opened_count > 0
+        assert factory.active_count == 0
+        assert get_ident() not in factory.thread_ids
+
+    @pytest.mark.asyncio
+    async def test_keeps_health_responsive_during_publication(
+        self, app, admin_headers, make_document, monkeypatch
+    ):
+        doc = make_document("Illustrated")
+        loop = asyncio.get_running_loop()
+        observations = []
+        publish = documents_router.prepare_bytes
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+
+            def delayed_publication(*args, **kwargs):
+                health = asyncio.run_coroutine_threadsafe(
+                    client.get("/api/v1/health"), loop
+                )
+                try:
+                    observations.append(health.result(timeout=2).status_code)
+                except TimeoutError:
+                    health.cancel()
+                    observations.append(None)
+                return publish(*args, **kwargs)
+
+            monkeypatch.setattr(documents_router, "prepare_bytes", delayed_publication)
+            response = await client.post(
+                f"/api/v1/documents/{doc.id}/images",
+                headers=admin_headers,
+                files={"file": ("pic.png", _PNG, "image/png")},
+            )
+        assert response.status_code == 201, response.text
+        assert observations == [200]
+
+
+class TestImageCommitAcknowledgement:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_kind", ["document", "collection"])
+    async def test_lost_commit_acknowledgement_preserves_adopted_image(
+        self,
+        app,
+        db_session,
+        admin_headers,
+        make_document,
+        make_collection,
+        monkeypatch,
+        owner_kind,
+    ):
+        from app.db.models import OwnedStorageObject, StorageObjectState
+        from app.modules.storage.storage_backend.runtime import get_backend
+
+        owner = make_document() if owner_kind == "document" else make_collection()
+        db_session.commit()
+        backend = get_backend()
+        name = hashlib.sha256(_PNG).hexdigest() + ".png"
+        key = (
+            backend.document_image_key(owner.id, name)
+            if owner_kind == "document"
+            else backend.collection_image_key(owner.id, name)
+        )
+        route = (
+            f"/api/v1/documents/{owner.id}/images"
+            if owner_kind == "document"
+            else f"/api/v1/collections/{owner.id}/images"
+        )
+        original_commit = Session.commit
+        lost = False
+
+        def lost_acknowledgement(session):
+            nonlocal lost
+            adopting = (
+                session.exec(
+                    select(OwnedStorageObject).where(
+                        OwnedStorageObject.key == key,
+                        OwnedStorageObject.state == StorageObjectState.COMMITTED,
+                    )
+                ).first()
+                is not None
+            )
+            original_commit(session)
+            if adopting and not lost:
+                lost = True
+                raise RuntimeError("commit acknowledgement lost")
+
+        monkeypatch.setattr(Session, "commit", lost_acknowledgement)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with pytest.raises(RuntimeError, match="commit acknowledgement lost"):
+                await client.post(
+                    route,
+                    headers=admin_headers,
+                    files={"file": ("image.png", _PNG, "image/png")},
+                )
+        assert lost
+        assert backend.read_bytes(key) == _PNG
+        db_session.expire_all()
+        proof = db_session.exec(
+            select(OwnedStorageObject).where(OwnedStorageObject.key == key)
+        ).one()
+        assert proof.state is StorageObjectState.COMMITTED
+
+
+class TestBinaryCommitAcknowledgement:
+    @pytest.mark.asyncio
+    async def test_lost_final_commit_acknowledgement_keeps_binary_publication(
+        self, app, db_session, admin_headers, monkeypatch
+    ):
+        from app.db.models import Document, OwnedStorageObject, StorageObjectState
+        from app.modules.storage.storage_backend.runtime import get_backend
+
+        db_session.commit()
+        original_commit = Session.commit
+        lost = False
+
+        def lose_final_acknowledgement(session):
+            nonlocal lost
+            adopting = (
+                session.exec(
+                    select(OwnedStorageObject).where(
+                        OwnedStorageObject.object_kind == "document_file",
+                        OwnedStorageObject.state == StorageObjectState.COMMITTED,
+                    )
+                ).first()
+                is not None
+            )
+            original_commit(session)
+            if adopting and not lost:
+                lost = True
+                raise RuntimeError("final commit acknowledgement lost")
+
+        monkeypatch.setattr(Session, "commit", lose_final_acknowledgement)
+        data = b"%PDF-adopted-document"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with pytest.raises(RuntimeError, match="final commit acknowledgement lost"):
+                await client.post(
+                    "/api/v1/documents/upload",
+                    headers=admin_headers,
+                    data={"name": "Guide"},
+                    files={"file": ("guide.pdf", data, "application/pdf")},
+                )
+        assert lost
+        db_session.expire_all()
+        doc = db_session.exec(select(Document).where(Document.name == "Guide")).one()
+        assert doc.filename == "guide.pdf"
+        backend = get_backend()
+        key = backend.document_file_key(doc.id, doc.filename)
+        assert backend.read_bytes(key) == data
+        proof = db_session.exec(
+            select(OwnedStorageObject).where(OwnedStorageObject.key == key)
+        ).one()
+        assert proof.state is StorageObjectState.COMMITTED

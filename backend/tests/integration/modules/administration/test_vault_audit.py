@@ -48,6 +48,7 @@ from app.modules.storage.storage_utils import (
 )
 from tests.factories import (
     build_collection,
+    build_document,
     build_job,
     build_model,
     build_owned_storage_object,
@@ -1871,6 +1872,216 @@ class TestAllOwnedBlobKeys:
         assert external.path in keys
 
 
+class TestEmbeddedImageAuditFindings:
+    """The audit distinguishes current, retiring, missing and cross references."""
+
+    @staticmethod
+    def _details(finding: VaultAuditFinding) -> dict:
+        return json.loads(finding.details_json or "{}")
+
+    @staticmethod
+    def _findings(session: Session, run: VaultAuditRun) -> list[VaultAuditFinding]:
+        from sqlmodel import select as _select
+
+        return list(
+            session.exec(
+                _select(VaultAuditFinding).where(
+                    VaultAuditFinding.run_id == run.id
+                )
+            ).all()
+        )
+
+    def test_reports_a_pending_retirement_as_info(
+        self, db_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.factories import build_embedded_image_retirement
+
+        user = _make_user(db_session, "retire-owner")
+        run = _make_run(db_session, user)
+        doc = build_document(db_session, "doc")
+        name = "a" * 64 + ".png"
+        build_embedded_image_retirement(db_session, owner_id=doc.id, name=name)
+        key = get_backend().document_image_key(doc.id, name)
+        snapshot = StorageOwnershipSnapshot(
+            retiring=[
+                OwnedBlob(
+                    key=key,
+                    resource_type="document_image",
+                    resource_id=doc.id,
+                    display_name=name,
+                )
+            ]
+        )
+        monkeypatch.setattr(vault_audit, "ownership_snapshot", lambda _s: snapshot)
+        monkeypatch.setattr(get_backend(), "exists", lambda _key: True)
+
+        vault_audit.execute_run(run.id)
+
+        finding = next(
+            f
+            for f in self._findings(db_session, run)
+            if f.code == "embedded_image_retiring"
+        )
+        assert finding.severity is VaultAuditSeverity.INFO
+        details = self._details(finding)
+        assert details["name"] == name
+        assert details["resource_id"] == doc.id
+
+    def test_reports_a_missing_retiring_image(
+        self, db_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.factories import build_embedded_image_retirement
+
+        user = _make_user(db_session, "retire-missing")
+        run = _make_run(db_session, user)
+        doc = build_document(db_session, "doc")
+        name = "b" * 64 + ".png"
+        build_embedded_image_retirement(db_session, owner_id=doc.id, name=name)
+        key = get_backend().document_image_key(doc.id, name)
+        snapshot = StorageOwnershipSnapshot(
+            retiring=[
+                OwnedBlob(
+                    key=key,
+                    resource_type="document_image",
+                    resource_id=doc.id,
+                    display_name=name,
+                )
+            ]
+        )
+        monkeypatch.setattr(vault_audit, "ownership_snapshot", lambda _s: snapshot)
+        monkeypatch.setattr(get_backend(), "exists", lambda _key: False)
+
+        vault_audit.execute_run(run.id)
+
+        finding = next(
+            f
+            for f in self._findings(db_session, run)
+            if f.code == "embedded_image_missing"
+        )
+        assert finding.severity is VaultAuditSeverity.WARNING
+        assert self._details(finding)["state"] == "retiring"
+
+    def test_reports_cross_references_and_names_shared_across_namespaces(
+        self, db_session: Session
+    ) -> None:
+        from tests.factories import store_owned_bytes
+
+        user = _make_user(db_session, "cross-user")
+        run = _make_run(db_session, user)
+        owner = build_document(db_session, "owner")
+        referrer = build_document(db_session, "referrer")
+        name = "c" * 64 + ".png"
+        owner.body = f"![own](/api/v1/documents/{owner.id}/images/{name})"
+        referrer.body = (
+            f"![theirs](/api/v1/documents/{owner.id}/images/{name}) "
+            f"![also-own](/api/v1/documents/{referrer.id}/images/{name})"
+        )
+        db_session.add(owner)
+        db_session.add(referrer)
+        db_session.commit()
+        backend = get_backend()
+        for document_id in (owner.id, referrer.id):
+            store_owned_bytes(
+                db_session,
+                backend,
+                backend.document_image_key(document_id, name),
+                f"bytes-{document_id}".encode(),
+                object_kind="document_image",
+            )
+        db_session.commit()
+
+        vault_audit.execute_run(run.id)
+
+        findings = self._findings(db_session, run)
+        cross = next(f for f in findings if f.code == "embedded_image_cross_reference")
+        assert cross.severity is VaultAuditSeverity.WARNING
+        assert cross.repair_action == "reclaim_embedded_image"
+        cross_details = self._details(cross)
+        assert cross_details["owner_id"] == owner.id
+        assert cross_details["referrer_id"] == referrer.id
+        shared = next(f for f in findings if f.code == "embedded_image_shared_name")
+        assert self._details(shared)["owners"] == [
+            ["document", owner.id],
+            ["document", referrer.id],
+        ]
+
+    def test_cross_reference_finding_ignores_trashed_referrers(
+        self, db_session: Session
+    ) -> None:
+        from tests.factories import store_owned_bytes
+
+        user = _make_user(db_session, "cross-trashed")
+        run = _make_run(db_session, user)
+        owner = build_document(db_session, "owner")
+        referrer = build_document(db_session, "referrer", trashed=True)
+        name = "d" * 64 + ".png"
+        referrer.body = f"![theirs](/api/v1/documents/{owner.id}/images/{name})"
+        db_session.add(referrer)
+        db_session.commit()
+        store_owned_bytes(
+            db_session,
+            get_backend(),
+            get_backend().document_image_key(owner.id, name),
+            b"x",
+            object_kind="document_image",
+        )
+        db_session.commit()
+
+        vault_audit.execute_run(run.id)
+
+        assert not [
+            f
+            for f in self._findings(db_session, run)
+            if f.code == "embedded_image_cross_reference"
+        ]
+
+    def test_repair_copies_a_cross_reference_into_the_referrers_namespace(
+        self, db_session: Session, tmp_path: Path
+    ) -> None:
+        from app.modules.storage.storage_backend.local import LocalStorageBackend
+        from app.modules.storage.storage_backend.runtime import bind_backend
+        from tests._env import use_local_storage
+        from tests.factories import store_owned_bytes
+
+        use_local_storage(tmp_path)
+        bind_backend(LocalStorageBackend())
+        user = _make_user(db_session, "repair-user")
+        run = _make_run(db_session, user)
+        owner = build_document(db_session, "owner")
+        referrer = build_document(db_session, "referrer")
+        name = "e" * 64 + ".png"
+        referrer.body = f"![theirs](/api/v1/documents/{owner.id}/images/{name})"
+        db_session.add(referrer)
+        db_session.commit()
+        backend = get_backend()
+        source_key = backend.document_image_key(owner.id, name)
+        target_key = backend.document_image_key(referrer.id, name)
+        store_owned_bytes(
+            db_session,
+            backend,
+            source_key,
+            b"shared-bytes",
+            object_kind="document_image",
+        )
+        db_session.commit()
+        vault_audit.execute_run(run.id)
+        cross = next(
+            f
+            for f in self._findings(db_session, run)
+            if f.code == "embedded_image_cross_reference"
+        )
+
+        repaired = vault_audit.repair_finding(db_session, cross.id, user.id)
+        db_session.commit()
+
+        assert repaired.state is VaultAuditFindingState.RESOLVED
+        db_session.expire_all()
+        assert backend.read_bytes(target_key) == b"shared-bytes"
+        row = db_session.get(Document, referrer.id)
+        assert f"/api/v1/documents/{referrer.id}/images/{name}" in row.body
+        assert f"/documents/{owner.id}/images/" not in row.body
+
+
 class TestOwnershipSnapshot:
     def test_ownership_snapshot_includes_uploaded_multipart_cover(
         self, db_session: Session
@@ -1952,10 +2163,12 @@ class TestOwnershipSnapshot:
         assert "real.md" in primary_names
         assert "ghost.md" not in primary_names
 
-    def test_ownership_snapshot_document_embedded_image_id_must_match_row(
+    def test_ownership_snapshot_document_embedded_image_claims_its_owner_namespace(
         self,
         db_session: Session,
     ) -> None:
+        # A reference to another document's image is a cross-document claim on
+        # the image owner's exact key: purge of either side must see it.
         other = Document(name="other-doc", kind=DocumentKind.MARKDOWN)
         db_session.add(other)
         db_session.commit()
@@ -1972,9 +2185,18 @@ class TestOwnershipSnapshot:
 
         result = ownership_snapshot(db_session, discover=False)
 
-        embedded_keys = {blob.key for blob in result.embedded}
         stolen_key = get_backend().document_image_key(other.id, "stolen.png")
-        assert stolen_key not in embedded_keys
+        stolen = [blob for blob in result.embedded if blob.key == stolen_key]
+        assert len(stolen) == 1
+        assert stolen[0].resource_id == other.id
+        cross = result.cross_references
+        assert len(cross) == 1
+        assert (
+            cross[0].owner_kind.value,
+            cross[0].owner_id,
+            cross[0].name,
+            cross[0].referrer_id,
+        ) == ("document", other.id, "stolen.png", owner.id)
 
         owner.body = f"![pic](/documents/{owner.id}/images/mine.png)"
         db_session.add(owner)
@@ -1989,6 +2211,7 @@ class TestOwnershipSnapshot:
         assert len(matching) == 1
         assert matching[0].key == get_backend().document_image_key(owner.id, "mine.png")
         assert matching[0].display_name == "mine.png"
+        assert result2.cross_references == []
 
     def test_ownership_snapshot_skips_collection_row_with_no_id(
         self, db_session: Session, monkeypatch: pytest.MonkeyPatch
@@ -2011,7 +2234,7 @@ class TestOwnershipSnapshot:
             blob.resource_type == "collection_image" for blob in result.embedded
         )
 
-    def test_ownership_snapshot_collection_embedded_image_id_must_match_row(
+    def test_ownership_snapshot_collection_embedded_image_claims_owner_namespace(
         self,
         db_session: Session,
     ) -> None:
@@ -2030,7 +2253,17 @@ class TestOwnershipSnapshot:
         result = ownership_snapshot(db_session, discover=False)
 
         stolen_key = get_backend().collection_image_key(other.id, "stolen.png")
-        assert stolen_key not in {blob.key for blob in result.embedded}
+        stolen = [blob for blob in result.embedded if blob.key == stolen_key]
+        assert len(stolen) == 1
+        assert stolen[0].resource_id == other.id
+        cross = result.cross_references
+        assert len(cross) == 1
+        assert (
+            cross[0].owner_kind.value,
+            cross[0].owner_id,
+            cross[0].name,
+            cross[0].referrer_id,
+        ) == ("collection", other.id, "stolen.png", owner.id)
 
         owner.readme = f"![pic](/collections/{owner.id}/images/mine.png)"
         db_session.add(owner)
@@ -2046,3 +2279,5 @@ class TestOwnershipSnapshot:
         assert matching[0].key == get_backend().collection_image_key(
             owner.id, "mine.png"
         )
+        assert matching[0].display_name == "mine.png"
+        assert result2.cross_references == []

@@ -27,6 +27,9 @@ from app.core.time import utcnow
 from app.db.models import (
     Collection,
     Document,
+    EmbeddedImageOwnerKind,
+    EmbeddedImageRetirement,
+    EmbeddedImageRetirementState,
     File,
     GcItem,
     GcRun,
@@ -53,6 +56,20 @@ _COLLECTION_IMAGE_RE = re.compile(
     r"/api/v1/collections/(\d+)/images/([0-9a-f]{64}\.(?:png|jpe?g|gif|webp))"
 )
 _MAX_RESOURCES = 25
+
+
+def _pending_retirement_names(
+    session: Session, kind: EmbeddedImageOwnerKind, owner_id: int
+) -> set[str]:
+    return set(
+        session.exec(
+            select(EmbeddedImageRetirement.name).where(
+                EmbeddedImageRetirement.owner_kind == kind,
+                EmbeddedImageRetirement.owner_id == owner_id,
+                EmbeddedImageRetirement.state == EmbeddedImageRetirementState.PENDING,
+            )
+        ).all()
+    )
 _MAX_KEYS = 100
 _MAX_BYTES = 1024 * 1024 * 1024
 _BACKUP_MAX_AGE = timedelta(hours=24)
@@ -145,12 +162,13 @@ def _model_candidate(session: Session, row: Model) -> _Candidate:
     )
 
 
-def _document_candidate(row: Document) -> _Candidate:
+def _document_candidate(session: Session, row: Document) -> _Candidate:
     images = {
         name
         for document_id, name in _DOCUMENT_IMAGE_RE.findall(row.body or "")
         if int(document_id) == row.id
     }
+    images.update(_pending_retirement_names(session, EmbeddedImageOwnerKind.DOCUMENT, row.id))
     return _Candidate(
         kind="document",
         resource_id=int(row.id),
@@ -160,12 +178,15 @@ def _document_candidate(row: Document) -> _Candidate:
     )
 
 
-def _collection_candidate(row: Collection) -> _Candidate:
+def _collection_candidate(session: Session, row: Collection) -> _Candidate:
     images = {
         name
         for collection_id, name in _COLLECTION_IMAGE_RE.findall(row.readme or "")
         if int(collection_id) == row.id
     }
+    images.update(
+        _pending_retirement_names(session, EmbeddedImageOwnerKind.COLLECTION, row.id)
+    )
     return _Candidate(
         kind="collection",
         resource_id=int(row.id),
@@ -202,7 +223,7 @@ def _candidate_pool(session: Session, cutoff: datetime) -> list[_Candidate]:
         )
     ).all()
     candidates = [_model_candidate(session, row) for row in models]
-    candidates.extend(_document_candidate(row) for row in documents)
+    candidates.extend(_document_candidate(session, row) for row in documents)
     candidates.extend(
         _Candidate(
             kind="file",
@@ -214,7 +235,7 @@ def _candidate_pool(session: Session, cutoff: datetime) -> list[_Candidate]:
         for row in files
         if row.model_id not in model_ids
     )
-    candidates.extend(_collection_candidate(row) for row in collections)
+    candidates.extend(_collection_candidate(session, row) for row in collections)
     return sorted(
         candidates, key=lambda item: (item.deleted_at, item.kind, item.resource_id)
     )
@@ -548,10 +569,12 @@ def _require_unchanged_identity(run: GcRun, source) -> None:
 def finalize_plan(session: Session, run_id: int) -> GcRun:
     """Finalize one quarantined plan after all evidence is revalidated."""
     from app.modules.library.trash import (
+        enqueue_purge_deletions,
         hard_delete_collection,
         hard_delete_document,
         hard_delete_file,
         hard_delete_model,
+        prepare_purge_deletions,
     )
     from app.modules.storage.storage_deletion import process_storage_delete_intents
 
@@ -577,18 +600,25 @@ def finalize_plan(session: Session, run_id: int) -> GcRun:
         run.updated_at = utcnow()
         session.add(run)
         session.commit()
-        for item in items:
-            resource = _resource(session, item)
+        from app.modules.library.embedded_images import (
+            reconcile_embedded_image_references,
+        )
+
+        reconcile_embedded_image_references(session)
+        resources = [_resource(session, item) for item in items]
+        prepared = prepare_purge_deletions(session, resources)
+        for resource in resources:
             if isinstance(resource, Model):
-                hard_delete_model(session, resource)
+                hard_delete_model(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, Document):
-                hard_delete_document(session, resource)
+                hard_delete_document(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, File):
-                hard_delete_file(session, resource)
+                hard_delete_file(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, Collection):
-                hard_delete_collection(session, resource)
+                hard_delete_collection(session, resource, prepared_deletions=prepared)
             else:
                 raise GcSafetyError("gc_candidate_changed")
+        enqueue_purge_deletions(session, prepared)
         session.commit()
     except Exception as exc:
         session.rollback()

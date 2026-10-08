@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.db.models import CollectionRole, DocumentKind
+
+
+class EmbeddedImageState(BaseModel):
+    """One image in the owner namespace with its lifecycle state.
+
+    ``current`` images are referenced by the document body; ``retiring`` ones
+    were removed by a precise edit and remain stored and reclaimable until the
+    document is permanently deleted.
+    """
+
+    name: str
+    state: Literal["current", "retiring"]
+    removed_at: Optional[datetime] = None
 
 
 class DocumentListItem(BaseModel):
@@ -22,6 +35,7 @@ class DocumentListItem(BaseModel):
 
 class DocumentRead(DocumentListItem):
     body: Optional[str] = None  # markdown content (None for binary docs)
+    images: list[EmbeddedImageState] = Field(default_factory=list)
 
 
 class DocumentCreate(BaseModel):
