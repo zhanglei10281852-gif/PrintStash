@@ -85,11 +85,11 @@ export default function SharePage() {
   }, [model, locale]);
 
   const meshFile = useMemo(
-    () => model?.files.find((f) => MESH_TYPES.has(f.file_type)) ?? null,
+    () => model?.files.find((f) => MESH_TYPES.has(f.file_type) && f.is_available) ?? null,
     [model],
   );
   const gcodeFiles = useMemo(
-    () => model?.files.filter((f) => f.file_type === "gcode") ?? [],
+    () => model?.files.filter((f) => f.file_type === "gcode" && f.is_available) ?? [],
     [model],
   );
   const selectedGcode = useMemo(
@@ -367,14 +367,16 @@ export default function SharePage() {
               )}
               <div className="mt-1 flex items-center justify-between gap-2">
                 <span className="font-mono text-3xs text-on-surface-variant">
-                  {formatBytes(f.size_bytes)}
-                  {f.triangle_count
+                  {f.is_available
+                    ? formatBytes(f.size_bytes)
+                    : uiText("No longer available")}
+                  {f.is_available && f.triangle_count
                     ? uiText(" · {value1} tris", {
                         value1: String(f.triangle_count.toLocaleString(currentLocale())),
                       })
                     : ""}
                 </span>
-                {model.allow_download && (
+                {model.allow_download && f.is_available && (
                   <a
                     href={getAssetUrl(sharedDownloadUrl(token, f.id))}
                     className="inline-flex items-center gap-1 font-mono text-3xs uppercase tracking-wider text-primary hover:underline"

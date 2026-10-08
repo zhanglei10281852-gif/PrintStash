@@ -7,7 +7,11 @@ import { useUiLocale } from "@/lib/i18n";
 import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, Link2, Loader2, X } from "lucide-react";
 
-import { createModelShare, listModelShares, revokeShare } from "@/lib/api/share";
+import {
+  createModelShare,
+  listModelShares,
+  revokeShare,
+} from "@/lib/api/share";
 import { toast } from "@/lib/toast";
 import { FileRead, ShareLinkRead } from "@/types";
 import { ModalShell } from "@/components/ui/modal";
@@ -40,7 +44,15 @@ export function ShareDialog({
   const [selectedRevisionIds, setSelectedRevisionIds] = useState<number[]>([]);
   const [lastToken, setLastToken] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const gcodeFiles = useMemo(() => files.filter((f) => f.file_type === "gcode"), [files]);
+  const gcodeFiles = useMemo(
+    () => files.filter((f) => f.file_type === "gcode"),
+    [files],
+  );
+  const meshFiles = useMemo(
+    () =>
+      files.filter((f) => ["stl", "3mf", "obj", "step"].includes(f.file_type)),
+    [files],
+  );
 
   // Each open starts from a clean form. Adjusting state during the render that
   // flips `open` (React's documented alternative to a reset effect) keeps the
@@ -49,10 +61,16 @@ export function ShareDialog({
   if (open !== wasOpen) {
     setWasOpen(open);
     if (open) {
+      // A revision share pins exact identities, so a precise link defaults to
+      // every current mesh plus the recommended G-code revision.
       const recommended =
-        gcodeFiles.find((f) => f.is_recommended) ?? gcodeFiles[gcodeFiles.length - 1];
+        gcodeFiles.find((f) => f.is_recommended) ??
+        gcodeFiles[gcodeFiles.length - 1];
       setRevisionScope("all");
-      setSelectedRevisionIds(recommended ? [recommended.id] : []);
+      setSelectedRevisionIds([
+        ...meshFiles.map((f) => f.id),
+        ...(recommended ? [recommended.id] : []),
+      ]);
       setLoading(true);
     }
   }
@@ -71,7 +89,8 @@ export function ShareDialog({
       const created = await createModelShare(modelId, {
         expires_in_days: expiresInDays,
         allow_download: allowDownload,
-        revision_file_ids: revisionScope === "selected" ? selectedRevisionIds : null,
+        revision_file_ids:
+          revisionScope === "selected" ? selectedRevisionIds : null,
       });
       const full = shareUrl(created.url);
       setLastToken(full);
@@ -103,12 +122,15 @@ export function ShareDialog({
 
   function toggleRevision(id: number) {
     setSelectedRevisionIds((current) =>
-      current.includes(id) ? current.filter((candidate) => candidate !== id) : [...current, id],
+      current.includes(id)
+        ? current.filter((candidate) => candidate !== id)
+        : [...current, id],
     );
   }
 
   const createDisabled =
-    creating || (revisionScope === "selected" && selectedRevisionIds.length === 0);
+    creating ||
+    (revisionScope === "selected" && selectedRevisionIds.length === 0);
 
   return (
     <Localized>
@@ -162,10 +184,12 @@ export function ShareDialog({
                   onChange={(e) => setAllowDownload(e.target.checked)}
                   className="accent-primary"
                 />
-                <span className="text-xs text-on-surface">{uiText("Allow file download")}</span>
+                <span className="text-xs text-on-surface">
+                  {uiText("Allow file download")}
+                </span>
               </label>
             </div>
-            {gcodeFiles.length > 0 && (
+            {(gcodeFiles.length > 0 || meshFiles.length > 0) && (
               <div className="space-y-2">
                 <p className="font-mono text-3xs uppercase tracking-wider text-on-surface-variant">
                   {uiText("Revisions")}
@@ -196,6 +220,41 @@ export function ShareDialog({
                 </div>
                 {revisionScope === "selected" && (
                   <div className="max-h-44 overflow-y-auto rounded border border-outline-variant divide-y divide-outline-variant">
+                    {meshFiles.length > 0 && (
+                      <div className="px-3 pt-2 pb-1">
+                        <p className="font-mono text-3xs uppercase tracking-wider text-on-surface-variant">
+                          {uiText("Source Files")}
+                        </p>
+                      </div>
+                    )}
+                    {meshFiles.map((f) => (
+                      <label
+                        key={f.id}
+                        className="flex items-start gap-2 px-3 py-2 hover:bg-surface-container-low"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedRevisionIds.includes(f.id)}
+                          onChange={() => toggleRevision(f.id)}
+                          className="mt-0.5 accent-primary"
+                        />
+                        <span className="min-w-0">
+                          <span className="block text-xs text-on-surface truncate">
+                            {f.original_filename}
+                          </span>
+                          <span className="block font-mono text-3xs uppercase text-on-surface-variant">
+                            {f.file_type}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                    {gcodeFiles.length > 0 && (
+                      <div className="px-3 pt-2 pb-1">
+                        <p className="font-mono text-3xs uppercase tracking-wider text-on-surface-variant">
+                          {uiText("G-code Revisions")}
+                        </p>
+                      </div>
+                    )}
                     {gcodeFiles.map((f) => (
                       <label
                         key={f.id}
@@ -289,7 +348,9 @@ export function ShareDialog({
                           : l.revoked_at
                             ? uiText("Revoked")
                             : uiText("Expired")}
-                        {l.allow_download ? uiText(" · downloadable") : uiText(" · view-only")}
+                        {l.allow_download
+                          ? uiText(" · downloadable")
+                          : uiText(" · view-only")}
                         {l.revision_file_ids?.length
                           ? uiText(" · {value1} revs", {
                               value1: String(l.revision_file_ids.length),
@@ -299,7 +360,9 @@ export function ShareDialog({
                       <p className="font-mono text-3xs text-on-surface-variant">
                         {uiText("expires {value1} · {value2} views", {
                           value1: String(
-                            new Date(l.expires_at).toLocaleDateString(currentLocale()) ?? "",
+                            new Date(l.expires_at).toLocaleDateString(
+                              currentLocale(),
+                            ) ?? "",
                           ),
                           value2: String(l.access_count ?? ""),
                         })}

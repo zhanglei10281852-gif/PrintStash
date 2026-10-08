@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Duplex } from "node:stream";
 import type { SubjectCaption } from "../../src/types/captions";
 import type { SearchStatus } from "../../src/types/search";
+import type { MetadataRead } from "../../src/types/models";
 
 const now = "2026-06-04T00:24:22.000000";
 
@@ -34,7 +35,7 @@ function mockNode(row: ReturnType<typeof mockCollection>) {
   return { ...row, child_count: 0, descendant_count: 0, display_path: row.name };
 }
 
-const metadata = {
+const metadata: MetadataRead = {
   slicer_name: "OrcaSlicer",
   slicer_version: "OrcaSlicer 2.3.1",
   printer_model: "Creality Ender-3 V3 SE",
@@ -58,6 +59,13 @@ const metadata = {
   bbox_y_mm: null,
   bbox_z_mm: null,
   volume_mm3: null,
+  volume_measurement: {
+    state: "legacy_unassessed",
+    unit: "mm3",
+    method: null,
+    value_mm3: null,
+    cause: null,
+  },
   triangle_count: null,
 };
 
@@ -1007,6 +1015,59 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   }
   // The tree a level, a lookup or a search at a time. Every mock collection is
   // a top-level folder with nothing below it.
+  if (url.pathname.startsWith("/api/v1/outliner/")) {
+    const leaves = modelList.map(({ id, name, collection, collection_id }) => ({
+      kind: "model",
+      id,
+      name,
+      collection,
+      collection_id,
+      collection_label: mockCollections().find((row) => row.id === collection_id)?.name ?? null,
+    }));
+    const page = <T extends { name: string; id: number }>(items: T[]) => {
+      const offset = Number(url.searchParams.get("cursor") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const sorted = [...items].sort((a, b) => a.name.localeCompare(b.name) || a.id - b.id);
+      return {
+        items: sorted.slice(offset, offset + limit),
+        next_cursor: sorted.length > offset + limit ? String(offset + limit) : null,
+      };
+    };
+    if (url.pathname.endsWith("/collections")) {
+      const rows = mockCollections().map((row) => ({
+        ...mockNode(row),
+        direct_entry_count: leaves.filter((item) => item.collection_id === row.id).length,
+        subtree_entry_count: leaves.filter((item) => item.collection_id === row.id).length,
+        visible_child_count: 0,
+      }));
+      sendJson(res, {
+        ...page(url.searchParams.has("parent_id") ? [] : rows),
+        parent_direct_entry_count: leaves.filter((item) => item.collection_id === null).length,
+        revealed: rows.find((row) => row.id === Number(url.searchParams.get("reveal_id"))) ?? null,
+      });
+    } else if (url.pathname.endsWith("/entries")) {
+      const id = url.searchParams.get("collection_id");
+      sendJson(
+        res,
+        page(leaves.filter((row) => row.collection_id === (id === null ? null : Number(id)))),
+      );
+    } else {
+      const q = (url.searchParams.get("q") ?? "").toLowerCase();
+      const folders = mockCollections().map((row) => ({
+        kind: "collection",
+        id: row.id,
+        name: row.name,
+        collection: row.path,
+        collection_id: row.id,
+        collection_label: row.name,
+      }));
+      sendJson(
+        res,
+        page([...leaves, ...folders].filter((row) => row.name.toLowerCase().includes(q))),
+      );
+    }
+    return;
+  }
   if (url.pathname === "/api/v1/collections/children") {
     const top = url.searchParams.get("parent_id") === null;
     sendJson(res, { items: top ? mockCollections().map(mockNode) : [], next_cursor: null });

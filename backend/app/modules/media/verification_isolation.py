@@ -23,13 +23,13 @@ from printstash_core.mesh.similarity.verification import Verification
 
 from app.modules.media import mesh_isolation
 from app.modules.media.geometry_analysis import MAX_VERIFICATION_SECONDS
+from app.modules.media.mesh_contracts import ThumbnailFailureReason
 from app.modules.media.mesh_isolation import (
     MeshWorkerError,
-    pack_value,
     raise_reported_error,
-    unpack_value,
 )
-from app.modules.media.thumbnail_engine import ThumbnailFailureReason
+from app.modules.media.mesh_wire_values import pack_value, unpack_value
+from app.modules.media.native_budget import AnalysisWork, MeshSource
 
 EVIDENCE_MAGIC = b"VRF1"
 
@@ -76,5 +76,10 @@ def verify_paths(
         "verification_seconds": verification_seconds,
     }
     return decode_reply(
-        mesh_isolation.run_worker("app.modules.media.verification_worker", spec)
+        mesh_isolation.run_worker(
+            "app.modules.media.verification_worker",
+            spec,
+            sources=(MeshSource(first, first_type), MeshSource(second, second_type)),
+            work=AnalysisWork(),
+        )
     )

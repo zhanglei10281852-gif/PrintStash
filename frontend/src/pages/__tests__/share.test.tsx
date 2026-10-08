@@ -32,6 +32,7 @@ function publicFile(over: Partial<PublicFileRead> = {}): PublicFileRead {
     file_type: "stl",
     size_bytes: 2048,
     version: 1,
+    is_available: true,
     gcode_revision_number: null,
     revision_label: null,
     revision_status: null,
@@ -171,6 +172,37 @@ describe("SharePage", () => {
 
       await screen.findByText("Benchy");
       await waitFor(() => expect(screen.queryAllByText(/Download/i).length).toBeGreaterThan(0));
+    });
+  });
+
+  describe("a pinned revision that is no longer available", () => {
+    it("marks the file instead of offering a broken download", async () => {
+      // The stable failure result: the pinned revision keeps its place in the
+      // list, but no viewer or download control points at it, and the page does
+      // not fall through to a different revision.
+      renderShare({
+        routes: {
+          "GET /api/v1/share/abc123": json(
+            sharedModel({
+              allow_download: true,
+              files: [
+                publicFile({
+                  id: 30,
+                  original_filename: "rev-lost.gcode",
+                  file_type: "gcode",
+                  gcode_revision_number: 2,
+                  is_available: false,
+                }),
+              ],
+            }),
+          ),
+        },
+      });
+
+      await screen.findByText("Benchy");
+      expect(await screen.findByText("No longer available")).toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: /Download/i })).toBeNull();
+      expect(screen.getByRole("button", { name: /G-code/i })).toBeDisabled();
     });
   });
 

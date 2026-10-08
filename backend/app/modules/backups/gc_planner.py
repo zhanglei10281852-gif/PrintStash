@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 import app.modules.backups.backup.catalogue as backup_catalogue
 import app.modules.backups.backup.targets as backup_targets
@@ -40,6 +40,7 @@ from app.db.models import (
 )
 from app.db.scopes import trashed
 from app.db.session import get_session_factory
+from app.modules.identity import share
 from app.modules.storage.storage_backend.contracts import StorageTier
 from app.modules.storage.storage_backend.runtime import get_backend
 from app.modules.storage.storage_identity import independent_evidence
@@ -176,11 +177,19 @@ def _collection_candidate(row: Collection) -> _Candidate:
 
 
 def _candidate_pool(session: Session, cutoff: datetime) -> list[_Candidate]:
+    # Active revision shares hold exact Artifact identities; neither the held
+    # File nor a Model that owns one can enter a plan while the link is alive.
+    held_files = share.active_hold_file_ids_select()
+    held_models = (
+        select(File.model_id).where(col(File.id).in_(held_files)).distinct()
+    )
     models = session.exec(
-        select(Model).where(
+        select(Model)
+        .where(
             trashed(Model),
             Model.deleted_at <= cutoff,  # type: ignore[operator]
         )
+        .where(col(Model.id).not_in(held_models))
     ).all()
     model_ids = {int(row.id) for row in models if row.id is not None}
     documents = session.exec(
@@ -190,10 +199,12 @@ def _candidate_pool(session: Session, cutoff: datetime) -> list[_Candidate]:
         )
     ).all()
     files = session.exec(
-        select(File).where(
+        select(File)
+        .where(
             trashed(File),
             File.deleted_at <= cutoff,  # type: ignore[operator]
         )
+        .where(col(File.id).not_in(share.active_hold_file_ids_select()))
     ).all()
     collections = session.exec(
         select(Collection).where(
@@ -453,6 +464,17 @@ def _revalidate_plan(session: Session, run: GcRun) -> list[GcItem]:
             or resource.purge_token is not None
         ):
             raise GcSafetyError("gc_candidate_changed")
+        # A revision share created (or a trashed file pinned) after the preview
+        # is a change of candidate state: the hold must win this quarantine
+        # cycle, and the next plan excludes the held identity.
+        if item.resource_kind == "file" and share.file_is_held(
+            session, item.resource_id
+        ):
+            raise GcSafetyError("gc_candidate_held")
+        if item.resource_kind == "model" and share.model_is_held(
+            session, item.resource_id
+        ):
+            raise GcSafetyError("gc_candidate_held")
     return items
 
 
@@ -548,10 +570,12 @@ def _require_unchanged_identity(run: GcRun, source) -> None:
 def finalize_plan(session: Session, run_id: int) -> GcRun:
     """Finalize one quarantined plan after all evidence is revalidated."""
     from app.modules.library.trash import (
+        enqueue_purge_deletions,
         hard_delete_collection,
         hard_delete_document,
         hard_delete_file,
         hard_delete_model,
+        prepare_purge_deletions,
     )
     from app.modules.storage.storage_deletion import process_storage_delete_intents
 
@@ -577,18 +601,20 @@ def finalize_plan(session: Session, run_id: int) -> GcRun:
         run.updated_at = utcnow()
         session.add(run)
         session.commit()
-        for item in items:
-            resource = _resource(session, item)
+        resources = [_resource(session, item) for item in items]
+        prepared = prepare_purge_deletions(session, resources)
+        for resource in resources:
             if isinstance(resource, Model):
-                hard_delete_model(session, resource)
+                hard_delete_model(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, Document):
-                hard_delete_document(session, resource)
+                hard_delete_document(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, File):
-                hard_delete_file(session, resource)
+                hard_delete_file(session, resource, prepared_deletions=prepared)
             elif isinstance(resource, Collection):
-                hard_delete_collection(session, resource)
+                hard_delete_collection(session, resource, prepared_deletions=prepared)
             else:
                 raise GcSafetyError("gc_candidate_changed")
+        enqueue_purge_deletions(session, prepared)
         session.commit()
     except Exception as exc:
         session.rollback()

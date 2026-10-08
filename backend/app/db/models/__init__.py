@@ -67,6 +67,9 @@ from .identity import (
     ShareLink as ShareLink,
 )
 from .identity import (
+    ShareLinkPin as ShareLinkPin,
+)
+from .identity import (
     User as User,
 )
 from .inference import EmbeddingSpace as EmbeddingSpace
@@ -84,12 +87,14 @@ from .ingestion import (
 from .ingestion import (
     InboxItemResult as InboxItemResult,
 )
+from .ingestion import IngestionEntry as IngestionEntry
 from .ingestion import (
     IngestRequest as IngestRequest,
 )
 from .ingestion import (
     StagingLease as StagingLease,
 )
+from .ingestion_scratch import IngestionScratchWindow as IngestionScratchWindow
 from .library import (
     ArtifactMaterialRequirement as ArtifactMaterialRequirement,
 )
@@ -156,6 +161,7 @@ from .media import (
 from .media import (
     DerivativeRegeneration as DerivativeRegeneration,
 )
+from .media import MeshFingerprintContinuation as MeshFingerprintContinuation
 from .notifications import (
     NotificationChannel as NotificationChannel,
 )
@@ -270,6 +276,7 @@ from .storage import (
 from .storage import (
     StorageFailureDomainDeclaration as StorageFailureDomainDeclaration,
 )
+from .storage import StoragePublicationLocator as StoragePublicationLocator
 from .types import (
     SENTINEL_FILE_HASH as SENTINEL_FILE_HASH,
 )
@@ -331,6 +338,7 @@ from .types import (
 from .types import (
     InboxSourceKind as InboxSourceKind,
 )
+from .types import IngestionEntryState as IngestionEntryState
 from .types import (
     IngestRequestKind as IngestRequestKind,
 )

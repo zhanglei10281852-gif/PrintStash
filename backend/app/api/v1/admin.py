@@ -31,6 +31,7 @@ from app.modules.identity.auth import (
     hash_password,
     invalidate_user_sessions,
 )
+from app.modules.identity.share import ShareHoldError
 from app.modules.library.trash import (
     PurgeConflictError,
     StorageRiskConfirmationRequired,
@@ -246,6 +247,12 @@ def admin_delete_resource(
             session.rollback()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=exc.detail
+            ) from exc
+        except ShareHoldError as exc:
+            session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="share_hold_active",
             ) from exc
         except UnsafeStorageDeleteError as exc:
             session.rollback()

@@ -49,6 +49,9 @@ class PublicFileRead(BaseModel):
     file_type: str
     size_bytes: int
     version: int
+    # False only for a pinned revision whose catalog row is no longer
+    # recoverable: the share keeps its place in the list but cannot serve it.
+    is_available: bool = True
     gcode_revision_number: Optional[int] = None
     revision_label: Optional[str] = None
     revision_status: Optional[FileRevisionStatus] = None

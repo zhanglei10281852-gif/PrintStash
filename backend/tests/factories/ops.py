@@ -14,7 +14,8 @@ import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from sqlmodel import Session
 
@@ -69,6 +70,9 @@ from app.db.models import (
 )
 from app.modules.storage.storage_identity import StorageTargetIdentity
 from tests.factories._support import nth, reject_aliases, save, unique_hash
+
+if TYPE_CHECKING:
+    from app.db.models import MeshFingerprintContinuation
 
 
 def build_failure_domain_declaration(
@@ -260,6 +264,9 @@ def build_job(
         {"subject_key": "subject", "owner_user_id": "owner", "finished_at": "finished"},
     )
     overrides.setdefault("id", f"job-{nth('job')}")
+    overrides.setdefault("execution_epoch", uuid4().hex)
+    if overrides.get("attempts", 0) > 0:
+        overrides.setdefault("submitted_epoch", overrides["execution_epoch"])
     terminal = state in {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
     if finished if finished is not None else terminal:
         overrides["finished_at"] = overrides.get("updated_at") or utcnow()
@@ -346,6 +353,10 @@ def build_derivative(
     if exhausted:
         overrides.setdefault("attempts", settings.derivative_max_attempts)
     overrides.setdefault("attempts", 1)
+    if state is DerivativeState.RUNNING:
+        from uuid import uuid4
+
+        overrides.setdefault("attempt_token", str(uuid4()))
     if state in (DerivativeState.FAILED, DerivativeState.SKIPPED):
         # The database refuses a failure or skip that does not say why.
         overrides.setdefault("failure_reason", f"test_{state.value}")
@@ -701,3 +712,103 @@ def build_audit_event(
     overrides.setdefault("dedup_key", f"audit-event-{nth('audit_event')}")
     overrides.setdefault("event_type", "storage_regression")
     return save(session, VaultAuditEvent(run_id=run.id, **overrides))
+
+
+def build_job_context(job_id: str):
+    """Claim a real stored Job before invoking a worker body directly in a test."""
+    from app.db.session import get_session_factory
+    from app.modules.work.runner import ExecutionContext, _begin
+    from app.modules.work.submission import execution_id
+
+    with get_session_factory().scoped_session() as session:
+        job = session.get(Job, job_id)
+        assert job is not None, f"worker context requires stored Job: {job_id}"
+        attempt = (
+            job.attempts
+            if job.state in {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
+            else max(1, job.attempts)
+        )
+        context = ExecutionContext(
+            job.id,
+            job.kind,
+            job.subject_key,
+            job.priority,
+            execution_id(job.id, attempt, job.execution_epoch),
+            attempt,
+            job.execution_epoch,
+        )
+    _begin(job_id, attempt, context.execution_epoch)
+    return context
+
+
+def build_mesh_continuation(
+    session: Session, file: File, *, job: Job | None = None, **overrides: Any
+) -> MeshFingerprintContinuation:
+    """Durable mesh analysis input, separate from completed basic outputs."""
+    from app.core.config import settings
+    from app.db.models import MeshFingerprintContinuation
+    from app.modules.derivatives.kinds import recipes_for
+    from app.modules.derivatives.mesh_continuation_values import encode_source
+    from app.modules.derivatives.records import ArtifactSource
+    from app.modules.media.fingerprints import ALGORITHM_VERSION
+
+    assert file.id is not None
+    reject_aliases(overrides, {"file_id": "file"})
+    overrides.setdefault("token", str(uuid4()))
+    overrides.setdefault("source_sha256", file.sha256)
+    overrides.setdefault("metadata_recipe", recipes_for(file)[DerivativeKind.METADATA])
+    overrides.setdefault("algorithm_version", ALGORITHM_VERSION)
+    overrides.setdefault("triangle_cap", settings.similarity_triangle_cap)
+    overrides.setdefault("source_identity_json", encode_source(ArtifactSource.of(file)))
+    overrides.setdefault("regenerated_at", None)
+    overrides.setdefault("job_id", None if job is None else job.id)
+    overrides.setdefault(
+        "execution_epoch", None if job is None else job.execution_epoch
+    )
+    overrides.setdefault("job_attempt", None if job is None else job.attempts)
+    return save(session, MeshFingerprintContinuation(file_id=file.id, **overrides))
+
+
+def build_job_history(
+    session: Session, *, count: int, kind: JobKind, subject: str
+) -> None:
+    """Seed terminal history from the canonical Job builder in one bulk batch.
+
+    The original row supplies valid state, timestamps and attempt authority;
+    historical copies differ only in their independent Job identities.
+    """
+    from sqlalchemy import insert
+
+    if type(count) is not int or count <= 0:
+        raise ValueError("history count must be a positive integer")
+    template = build_job(
+        session, kind=kind, state=JobState.COMPLETED, subject=subject, attempts=1
+    )
+    values = template.model_dump()
+    if count > 1:
+        session.execute(
+            insert(Job),
+            [dict(values, id=uuid4().hex) for _ in range(count - 1)],
+        )
+        session.commit()
+
+
+def build_ingestion_entry(session: Session, job: Job, **overrides: Any):
+    """A pending frozen unit under a real Job, ready for schema-boundary tests."""
+    from app.db.models import IngestionEntry
+    from app.modules.ingestion.batch_contracts import (
+        LocalSource,
+        encode_source_descriptor,
+    )
+
+    identity = overrides.pop("identity", f"entry-{nth('ingestion_entry')}")
+    values = {
+        "job_id": job.id,
+        "entry_key": hashlib.sha256(identity.encode()).hexdigest(),
+        "identity": identity,
+        "display_name": "part.stl",
+        "descriptor_json": encode_source_descriptor(LocalSource("factory")),
+        "ordinal": 0,
+    }
+    values.update(overrides)
+    return save(session, IngestionEntry(**values))

@@ -27,6 +27,7 @@ from app.db.models import (
     User,
 )
 from app.db.scopes import live
+from app.modules.media.fingerprints import ALGORITHM_VERSION
 from app.modules.similarity.configuration import read_settings
 from app.modules.similarity.fingerprints import (
     current_source,
@@ -54,8 +55,6 @@ def current_evidence(candidate=SimilarityCandidate):
         .join(b, b.id == observation.fingerprint_b_id)
         .join(fa, fa.id == a.file_id)
         .join(fb, fb.id == b.file_id)
-        .join(ma, ma.id == fa.model_id)
-        .join(mb, mb.id == fb.model_id)
         .where(
             observation.candidate_id == candidate.id,
             or_(
@@ -68,12 +67,21 @@ def current_evidence(candidate=SimilarityCandidate):
             fb.sha256 == observation.input_hash_b,
             a.source_sha256 == fa.sha256,
             b.source_sha256 == fb.sha256,
+            candidate.algorithm_version == ALGORITHM_VERSION,
             a.algorithm_version == candidate.algorithm_version,
             b.algorithm_version == candidate.algorithm_version,
             col(a.state).in_(("ready", "partial")),
             col(b.state).in_(("ready", "partial")),
-            *live_source_predicates(fa, ma),
-            *live_source_predicates(fb, mb),
+            select(ma.id)
+            .where(ma.id == fa.model_id, *live_source_predicates(fa, ma))
+            .correlate(fa)
+            .scalar_subquery()
+            .is_not(None),
+            select(mb.id)
+            .where(mb.id == fb.model_id, *live_source_predicates(fb, mb))
+            .correlate(fb)
+            .scalar_subquery()
+            .is_not(None),
         )
         .correlate(candidate)
         .exists()
@@ -81,20 +89,29 @@ def current_evidence(candidate=SimilarityCandidate):
 
 
 def visible_query(session: Session, actor: User):
+    # Candidate endpoints are known identities. Correlated point lookups prevent
+    # stale small-catalog statistics from starting with a full Model scan.
+    # A primary-key scalar is at most one row. Keeping it scalar preserves
+    # keyed plans where flattening EXISTS reintroduced catalog scans.
     a, b = aliased(Model), aliased(Model)
-    return (
-        select(SimilarityCandidate)
-        .join(a, a.id == SimilarityCandidate.model_a_id)
-        .join(b, b.id == SimilarityCandidate.model_b_id)
+    visible_endpoints = [
+        select(model.id)
         .where(
-            SimilarityCandidate.confidence > 0,
-            live(a),
-            live(b),
-            col(a.purge_token).is_(None),
-            col(b.purge_token).is_(None),
-            editable_models(session, actor, a),
-            editable_models(session, actor, b),
+            model.id == endpoint,
+            live(model),
+            col(model.purge_token).is_(None),
+            editable_models(session, actor, model),
         )
+        .correlate(SimilarityCandidate)
+        .scalar_subquery()
+        .is_not(None)
+        for model, endpoint in (
+            (a, col(SimilarityCandidate.model_a_id)),
+            (b, col(SimilarityCandidate.model_b_id)),
+        )
+    ]
+    return select(SimilarityCandidate).where(
+        SimilarityCandidate.confidence > 0, *visible_endpoints
     )
 
 

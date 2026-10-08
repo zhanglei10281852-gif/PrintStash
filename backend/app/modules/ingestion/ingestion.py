@@ -22,6 +22,7 @@ from sqlalchemy import case, func, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.core.cancellation import OperationCancelled, checkpoint
 from app.core.logging import get_logger
 from app.core.time import utcnow
 from app.db.models import (
@@ -45,6 +46,7 @@ from app.db.scopes import live
 from app.db.session import SessionFactory, get_session_factory
 from app.modules.identity import rbac
 from app.modules.library import taxonomy
+from app.modules.library.volume_metadata import apply_volume, incoming_volume
 from app.modules.storage import storage
 from app.modules.storage.hashing import sha256_file
 from app.modules.storage.storage_backend.contracts import (
@@ -53,11 +55,17 @@ from app.modules.storage.storage_backend.contracts import (
 )
 from app.modules.storage.storage_backend.local import LocalStorageBackend
 from app.modules.storage.storage_backend.runtime import get_backend
-from app.modules.storage.storage_ownership import provider_ref_for_backend, publish_file
-from app.modules.work.contracts import JobOutcome
+from app.modules.storage.storage_ownership import (
+    abandon_publication,
+    finish_publication_batch,
+    prepare_file,
+    provider_ref_for_backend,
+)
+from app.modules.work.contracts import JobContext, JobOutcome
 from app.modules.work.jobs import failure_of
 
 if TYPE_CHECKING:
+    from app.modules.ingestion.batch_contracts import BatchCommitReference
     from app.modules.library.provenance import ProvenanceContext
 
 logger = get_logger(__name__)
@@ -140,7 +148,7 @@ def _resolve_committed_artifact(
 
 def _attach_ingested_artifact(
     session: Session, file_row: File, context: ProvenanceContext
-) -> None:
+):
     """Attach provenance without taking over artifact transaction ownership.
 
     The import is deliberately deferred so all existing ingestion callers stay
@@ -150,7 +158,7 @@ def _attach_ingested_artifact(
     """
     from app.modules.library.provenance import attach_ingested_artifact
 
-    attach_ingested_artifact(session, file_row, context)
+    return attach_ingested_artifact(session, file_row, context).storage_retirements
 
 
 def verify_durable_artifact(
@@ -378,6 +386,7 @@ def persist_artifact(
     session_factory: SessionFactory | None = None,
     staged_origin: StagedRemoteObject | None = None,
     auto_recommend_first_gcode: bool = True,
+    batch_commit: BatchCommitReference | None = None,
 ) -> File:
     """Persist a staged artifact onto *model*: the only Artifact-persistence path.
 
@@ -402,6 +411,7 @@ def persist_artifact(
       upload is moved onto the library root.
     """
     assert model.id is not None
+    volume = incoming_volume(meta, file_type)
     backend = get_backend()
 
     if is_external:
@@ -468,6 +478,8 @@ def persist_artifact(
             f"artifact:{model_id}:{version}", [allocation]
         )
     blob_receipt = None
+    blob_publication = None
+    provenance_retirements = ()
     commit_started = False
     commit_resolved = False
     try:
@@ -501,7 +513,7 @@ def persist_artifact(
                 # not create a vault ownership-ledger row or delete intent.
                 blob_receipt = external_backend.move_in(staged_path, dest_key)
             else:
-                blob_receipt = publish_file(
+                blob_publication = prepare_file(
                     session,
                     backend,
                     dest_key,
@@ -511,6 +523,7 @@ def persist_artifact(
                     move=True,
                     remote_source=staged_origin,
                 )
+                blob_receipt = blob_publication.receipt
         if blob_receipt is not None:
             size_bytes = blob_receipt.size
         elif is_external and not move_blob:
@@ -578,7 +591,9 @@ def persist_artifact(
             # The File id exists, but the Artifact has not yet become visible.
             # A provenance failure therefore follows the established rollback
             # path for both its link and the bytes/row it describes.
-            _attach_ingested_artifact(session, file_row, provenance_context)
+            provenance_retirements = _attach_ingested_artifact(
+                session, file_row, provenance_context
+            )
         # A caller's facts may carry detection-only keys (e.g.
         # printer_preset_name) that have no Metadata column.
         meta = meta or {}
@@ -587,7 +602,9 @@ def persist_artifact(
             for k, v in meta.items()
             if k in Metadata.model_fields and k not in {"id", "file_id", "created_at"}
         }
-        session.add(Metadata(file_id=file_row.id, **md_fields))
+        metadata = Metadata(file_id=file_row.id, **md_fields)
+        apply_volume(metadata, volume)
+        session.add(metadata)
         requirements = meta.get("material_requirements")
         if isinstance(requirements, list):
             for requirement in requirements:
@@ -605,13 +622,27 @@ def persist_artifact(
                     )
                 )
         content_changed(session, "model", [model_id])
+        if batch_commit is not None:
+            from .batch_store import record_committed
+
+            record_committed(session, batch_commit, file_row, deduplicated=False)
         # A driver may acknowledge a committed transaction as an exception
         # (for example, a connection loss after COMMIT). From here onward the
         # blob must be preserved until a fresh session resolves the outcome.
+        session.flush()
+        finish_publication_batch(
+            session,
+            publications=(blob_publication,) if blob_publication is not None else (),
+            retirements=provenance_retirements,
+        )
         commit_started = True
         session.commit()
-    except Exception as exc:
+    except BaseException as exc:
         session.rollback()
+        if commit_started and isinstance(exc, OperationCancelled):
+            # A cooperative stop cannot determine whether COMMIT was acknowledged.
+            # Keep authoritative bytes and ownership; retry finds any committed File.
+            raise
         if commit_started and blob_receipt is not None and not is_external:
             try:
                 resolved = _resolve_committed_artifact(
@@ -641,8 +672,14 @@ def persist_artifact(
         else:
             # Before the domain commit boundary, exact receipt rollback is safe.
             # External-library bytes remain user-owned for the next scan.
-            if blob_receipt is not None and not is_external:
-                backend.rollback_create(blob_receipt)
+            if blob_publication is not None and not is_external:
+                try:
+                    if abandon_publication(session, blob_publication):
+                        backend.rollback_create(blob_publication.receipt)
+                except Exception as cleanup_exc:
+                    # SQL retirement and physical rollback are both best effort;
+                    # retain the durable receipt if either cannot prove cleanup.
+                    exc.add_note(f"receipt cleanup failed: {cleanup_exc}")
             raise
 
     finally:
@@ -840,6 +877,7 @@ def commit_staged_artifact(
     session_factory: SessionFactory | None = None,
     provenance_context: ProvenanceContext | None = None,
     report: Report = _no_report,
+    batch_commit: BatchCommitReference | None = None,
 ) -> CommitOutcome:
     """Commit one staged file as an Artifact, exactly once per ``ingestion_key``.
 
@@ -854,6 +892,11 @@ def commit_staged_artifact(
         ).first()
         if committed is not None:
             assert committed.id is not None
+            if batch_commit is not None:
+                from .batch_store import record_committed
+
+                record_committed(recovery, batch_commit, committed, deduplicated=False)
+                recovery.commit()
             return CommitOutcome(
                 model_id=committed.model_id,
                 file_id=committed.id,
@@ -864,7 +907,7 @@ def commit_staged_artifact(
             )
 
     report(stage="hashing", label="hashing", step=1, total_steps=2, progress=0)
-    blob_hash = sha256_file(artifact.staged_path)
+    blob_hash = sha256_file(artifact.staged_path, on_chunk=checkpoint)
 
     if provenance_context is not None:
         provenance_context = replace(provenance_context, blob_sha256=blob_hash)
@@ -885,7 +928,19 @@ def commit_staged_artifact(
                 existing_file = session.get(File, preflight.file_id)
                 if existing_file is None:
                     raise RuntimeError("captured_artifact_missing")
-                attach_existing_artifact(session, existing_file, provenance_context)
+                merged = attach_existing_artifact(
+                    session, existing_file, provenance_context
+                )
+                if batch_commit is not None:
+                    from .batch_store import record_committed
+
+                    record_committed(
+                        session, batch_commit, existing_file, deduplicated=True
+                    )
+                session.flush()
+                finish_publication_batch(
+                    session, publications=(), retirements=merged.storage_retirements
+                )
                 session.commit()
             return CommitOutcome(
                 model_id=preflight.model_id,
@@ -951,6 +1006,7 @@ def commit_staged_artifact(
             provenance_context=provenance_context,
             session_factory=session_factory,
             staged_origin=artifact.staged_origin,
+            batch_commit=batch_commit,
         )
         assert file_row.id is not None
         model_id, file_id = model.id, file_row.id
@@ -960,25 +1016,26 @@ def commit_staged_artifact(
         model_id=model_id,
         file_id=file_id,
         created=created,
-        deduplicated=not created,
+        deduplicated=False,
         committed_at=utcnow(),
     )
 
 
-def release_job_staging(
-    job_id: str, session_factory: SessionFactory | None = None
-) -> None:
-    """Remove a finished upload Job's own staged file and its lease.
+def release_job_staging(job_context: JobContext) -> None:
+    """Release exact staging receipts only while this execution remains terminal."""
+    from app.modules.work.jobs import jobs
 
-    A capture-slot lease is never released here: its bytes belong to the
-    capture slot until the Pending Import that owns it is settled.
-    """
-    session_factory = session_factory or get_session_factory()
-    with session_factory.scoped_session() as session:
-        from .staging_cleanup import release_job
+    from .staging_cleanup import release_job
 
-        release_job(session, job_id)
-        session.commit()
+    def release(session: Session, _subject: str) -> None:
+        release_job(session, job_context.job_id)
+
+    jobs.reconcile_settled_attempt(
+        job_context.job_id,
+        job_context.attempt,
+        release,
+        execution_epoch=job_context.execution_epoch,
+    )
 
 
 def _committed_by_key(
@@ -1000,7 +1057,7 @@ def _committed_by_key(
 
 def ingest_staged_file(
     *,
-    job_id: str,
+    job_context: JobContext,
     artifact: StagedArtifact,
     actor_user_id: int | None,
     session_factory: SessionFactory | None = None,
@@ -1008,11 +1065,10 @@ def ingest_staged_file(
     ingestion_key: str | None = None,
 ) -> CommitOutcome | None:
     """Commit one staged file on behalf of Job ``job_id`` and settle the Job."""
-    from app.modules.work.jobs import jobs
+    job_id = job_context.job_id
 
     key = ingestion_key or job_id
-    jobs.update(
-        job_id,
+    job_context.update(
         current_item=artifact.original_filename,
         total=1,
     )
@@ -1023,21 +1079,18 @@ def ingest_staged_file(
             actor_user_id=actor_user_id,
             session_factory=session_factory,
             provenance_context=provenance_context,
-            report=lambda **fields: jobs.update(job_id, **fields),
+            report=lambda **fields: job_context.update(**fields),
         )
     except Exception as exc:  # noqa: BLE001 - the Job records the failure
         logger.exception("ingestion commit failed", extra={"job_id": job_id})
         committed = _committed_by_key(key, session_factory)
         if committed is None:
-            jobs.finish(
-                job_id, JobOutcome.FAILED, error=failure_of(exc), retryable=True
-            )
+            job_context.finish(JobOutcome.FAILED, error=failure_of(exc), retryable=True)
             return None
         # The Artifact is durable even though a later step failed: report what
         # exists rather than a failure the user would retry into a duplicate.
         model_id, file_id = committed
-        jobs.finish(
-            job_id,
+        job_context.finish(
             JobOutcome.COMPLETED,
             completion="partial",
             model_id=model_id,
@@ -1047,11 +1100,10 @@ def ingest_staged_file(
             total=1,
             succeeded=1,
         )
-        release_job_staging(job_id, session_factory)
+        release_job_staging(job_context)
         return None
     _fault_injection_checkpoint("before_terminal", job_id)
-    jobs.finish(
-        job_id,
+    job_context.finish(
         JobOutcome.COMPLETED,
         completion="complete",
         model_id=outcome.model_id,
@@ -1068,7 +1120,7 @@ def ingest_staged_file(
             **({"deduplicated": True} if outcome.deduplicated else {}),
         },
     )
-    release_job_staging(job_id, session_factory)
+    release_job_staging(job_context)
     return outcome
 
 
@@ -1091,7 +1143,7 @@ def add_gcode_revision_to_model(
     returns as soon as the bytes are durable.
     """
     assert model.id is not None
-    blob_hash = sha256_file(staged_path)
+    blob_hash = sha256_file(staged_path, on_chunk=checkpoint)
 
     # Revisions follow the model: if it lives in a NAS library, write back there.
     dest = resolve_write_target(

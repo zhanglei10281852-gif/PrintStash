@@ -160,7 +160,7 @@ class TestPublicModelView:
         # The owner's share list shows how often a link has been opened.
         assert db_session.get(ShareLink, created["id"]).access_count == 2
 
-    def test_serves_only_the_revisions_the_link_scopes_to(
+    def test_serves_only_the_revisions_the_link_pins(
         self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
     ) -> None:
         model = _make_model(db_session, slug="scope", hash_="q" * 64)
@@ -169,17 +169,73 @@ class TestPublicModelView:
         chosen = _make_file(
             db_session, model, filename="rev2.gcode", ftype="gcode", version=3
         )
-        chosen.revision_label = "PLA fast"
-        chosen.revision_status = FileRevisionStatus.KNOWN_GOOD
-        db_session.add(chosen)
-        db_session.commit()
 
         created = _create_share(
-            client, auth_headers, model.id, revision_file_ids=[chosen.id]
+            client,
+            auth_headers,
+            model.id,
+            revision_file_ids=[mesh.id, chosen.id],
         )
         body = client.get(f"/api/v1/share/{created['token']}").json()
 
         assert {row["id"] for row in body["files"]} == {mesh.id, chosen.id}
+
+    def test_a_gcode_only_pin_does_not_follow_a_new_mesh_revision(
+        self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
+    ) -> None:
+        model = _make_model(db_session, slug="pin-stl", hash_="qs" * 32)
+        first_mesh = _make_file(
+            db_session, model, filename="part.stl", version=1, path="/k/part1.stl"
+        )
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[first_mesh.id]
+        )
+        _make_file(
+            db_session, model, filename="part-v2.stl", version=2, path="/k/part2.stl"
+        )
+
+        body = client.get(f"/api/v1/share/{created['token']}").json()
+
+        assert [row["id"] for row in body["files"]] == [first_mesh.id]
+        assert body["files"][0]["is_available"] is True
+
+    def test_keeps_showing_a_pinned_revision_after_it_is_trashed(
+        self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
+    ) -> None:
+        model = _make_model(db_session, slug="pinned-trashed", hash_="qt" * 32)
+        chosen = _make_file(
+            db_session, model, filename="rev1.gcode", ftype="gcode", version=1
+        )
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[chosen.id]
+        )
+        chosen.deleted_at = utcnow()
+        db_session.add(chosen)
+        db_session.commit()
+
+        body = client.get(f"/api/v1/share/{created['token']}").json()
+
+        assert [row["id"] for row in body["files"]] == [chosen.id]
+        assert body["files"][0]["is_available"] is True
+
+    def test_still_resolves_after_the_model_is_trashed(
+        self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
+    ) -> None:
+        model = _make_model(db_session, slug="pinned-model-trashed", hash_="qm" * 32)
+        chosen = _make_file(
+            db_session, model, filename="rev1.gcode", ftype="gcode", version=1
+        )
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[chosen.id]
+        )
+        model.deleted_at = utcnow()
+        db_session.add(model)
+        db_session.commit()
+
+        response = client.get(f"/api/v1/share/{created['token']}")
+
+        assert response.status_code == 200, response.text
+        assert [row["id"] for row in response.json()["files"]] == [chosen.id]
 
     def test_describes_the_shared_revision(
         self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
@@ -253,6 +309,32 @@ class TestSharedThumbnail:
         assert response.status_code == 404, response.text
         assert response.json()["detail"] == "not_found"
 
+    def test_serves_the_cover_snapshot_when_the_model_cover_moves(
+        self, client: TestClient, db_session: Session, auth_headers: dict[str, str]
+    ) -> None:
+        model = _make_model(db_session, slug="pinned-thumb", hash_="1b" * 32)
+        mesh = _make_file(db_session, model, filename="x.stl", ftype="stl")
+        backend = get_backend()
+        backend.write_bytes(b"webp-original", backend.thumbnail_key(mesh.id))
+        model.thumbnail_file_id = mesh.id
+        db_session.add(model)
+        db_session.commit()
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[mesh.id]
+        )
+        newer = _make_file(
+            db_session, model, filename="y.stl", ftype="stl", version=2
+        )
+        backend.write_bytes(b"webp-replacement", backend.thumbnail_key(newer.id))
+        model.thumbnail_file_id = newer.id
+        db_session.add(model)
+        db_session.commit()
+
+        response = client.get(f"/api/v1/share/{created['token']}/thumbnail")
+
+        assert response.status_code == 200, response.text
+        assert response.content == b"webp-original"
+
 
 class TestSharedStl:
     def test_serves_a_mesh_file(
@@ -298,6 +380,59 @@ class TestSharedStl:
         response = client.get(f"/api/v1/share/{created['token']}/files/{mesh.id}/stl")
 
         assert response.status_code == 200, "the viewer works without download rights"
+
+    def test_serves_a_pinned_mesh_after_it_is_trashed(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="stl-pinned-trashed", hash_="2c" * 32)
+        key = stored_blob("share-stl-pinned.stl", b"solid pinned endsolid")
+        mesh = _make_file(db_session, model, filename="part.stl", path=key)
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[mesh.id]
+        )
+        mesh.deleted_at = utcnow()
+        db_session.add(mesh)
+        db_session.commit()
+
+        response = client.get(f"/api/v1/share/{created['token']}/files/{mesh.id}/stl")
+
+        assert response.status_code == 200, response.text
+        assert response.content == b"solid pinned endsolid"
+
+    def test_refuses_a_newer_mesh_the_link_did_not_pin(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="stl-pinned-new", hash_="2d" * 32)
+        first = _make_file(
+            db_session,
+            model,
+            filename="part.stl",
+            path=stored_blob("share-stl-first.stl"),
+        )
+        created = _create_share(
+            client, auth_headers, model.id, revision_file_ids=[first.id]
+        )
+        newer = _make_file(
+            db_session,
+            model,
+            filename="part-v2.stl",
+            version=2,
+            path=stored_blob("share-stl-newer.stl"),
+        )
+
+        response = client.get(
+            f"/api/v1/share/{created['token']}/files/{newer.id}/stl"
+        )
+
+        assert response.status_code == 404, response.text
 
 
 class TestSharedDownload:
@@ -390,6 +525,34 @@ class TestSharedDownload:
         assert response.status_code == 200, response.text
         assert response.content == payload
 
+    def test_downloads_a_pinned_file_after_it_is_trashed(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="dl-pinned-trashed", hash_="5a" * 32)
+        key = stored_blob("share-download-pinned.stl")
+        row = _make_file(db_session, model, path=key)
+        created = _create_share(
+            client,
+            auth_headers,
+            model.id,
+            allow_download=True,
+            revision_file_ids=[row.id],
+        )
+        row.deleted_at = utcnow()
+        db_session.add(row)
+        db_session.commit()
+
+        response = client.get(
+            f"/api/v1/share/{created['token']}/files/{row.id}/download"
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.content == b"stl-bytes"
+
 
 class TestSharedGcode:
     def test_serves_the_gcode(
@@ -459,6 +622,105 @@ class TestSharedGcode:
 
         assert response.status_code == 410, response.text
         assert response.json()["detail"] == "file_blob_missing"
+
+    def test_serves_a_pinned_revision_after_it_is_trashed(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="gcode-pinned-trashed", hash_="7a" * 32)
+        key = stored_blob("share-gcode-pinned.gcode", b"G1 X5\n")
+        gcode = _make_file(
+            db_session, model, filename="x.gcode", ftype="gcode", path=key
+        )
+        created = _create_share(
+            client,
+            auth_headers,
+            model.id,
+            allow_download=True,
+            revision_file_ids=[gcode.id],
+        )
+        gcode.deleted_at = utcnow()
+        db_session.add(gcode)
+        db_session.commit()
+
+        response = client.get(
+            f"/api/v1/share/{created['token']}/files/{gcode.id}/gcode"
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.content == b"G1 X5\n"
+
+
+class TestSharedToolpath:
+    def test_refuses_a_view_only_link(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="toolpath-view-only", hash_="7b" * 32)
+        key = stored_blob("share-toolpath-view-only.gcode", b"G1 X0 Y0\n")
+        gcode = _make_file(
+            db_session, model, filename="x.gcode", ftype="gcode", path=key
+        )
+        created = _create_share(
+            client,
+            auth_headers,
+            model.id,
+            allow_download=False,
+            revision_file_ids=[gcode.id],
+        )
+
+        response = client.get(
+            f"/api/v1/share/{created['token']}/files/{gcode.id}/toolpath"
+        )
+
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"] == "download_disabled"
+
+    def test_serves_a_pinned_revision_not_a_newer_one(
+        self,
+        client: TestClient,
+        db_session: Session,
+        auth_headers: dict[str, str],
+        stored_blob,
+    ) -> None:
+        model = _make_model(db_session, slug="toolpath-pin", hash_="7c" * 32)
+        key = stored_blob("share-toolpath-pin.gcode", b"G1 X1\n")
+        pinned = _make_file(
+            db_session, model, filename="rev1.gcode", ftype="gcode", path=key
+        )
+        created = _create_share(
+            client,
+            auth_headers,
+            model.id,
+            allow_download=True,
+            revision_file_ids=[pinned.id],
+        )
+        newer_key = stored_blob("share-toolpath-newer.gcode", b"G1 X2\n")
+        newer = _make_file(
+            db_session,
+            model,
+            filename="rev2.gcode",
+            ftype="gcode",
+            version=2,
+            path=newer_key,
+        )
+
+        refused = client.get(
+            f"/api/v1/share/{created['token']}/files/{newer.id}/toolpath"
+        )
+        served = client.get(
+            f"/api/v1/share/{created['token']}/files/{pinned.id}/toolpath"
+        )
+
+        assert refused.status_code == 404, refused.text
+        assert served.status_code == 200, served.text
+        assert served.content == b"G1 X1\n"
 
 
 class TestCreateShare:

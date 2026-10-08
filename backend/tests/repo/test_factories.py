@@ -27,6 +27,15 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from printstash_core.mesh.measurements import (
+    VolumeLegacyUnassessed,
+    VolumeMeasured,
+    VolumeNotCalculated,
+    VolumeNotCalculatedCause,
+    VolumeUnavailable,
+    VolumeUnavailableCause,
+    encode_volume,
+)
 from printstash_core.search.passages import SearchSubject, SubjectType
 from sqlmodel import Session, select
 
@@ -46,6 +55,7 @@ from app.db.models import (
 )
 from app.db.scopes import live, trashed
 from app.modules.library import taxonomy
+from app.modules.library.model_views.projections import metadata_read
 from tests import factories
 from tests.factories.library_scale import build_library_at_scale
 
@@ -140,6 +150,27 @@ class TestGeneratedIdentities:
         assert factories.build_model(db_session).slug == first_run
 
 
+class TestBuildMetadata:
+    @pytest.mark.parametrize(
+        "volume",
+        [
+            VolumeMeasured(6e-9),
+            VolumeUnavailable(VolumeUnavailableCause.NOT_WATERTIGHT),
+            VolumeNotCalculated(VolumeNotCalculatedCause.TOPOLOGY_NOT_EVALUATED),
+            VolumeLegacyUnassessed(-1.0),
+        ],
+    )
+    def test_publishes_requested_volume_evidence(self, db_session, volume):
+        model = factories.build_model(db_session)
+        artifact = factories.build_file(db_session, model)
+        metadata = factories.build_metadata(db_session, artifact, volume=volume)
+
+        public = metadata_read(db_session, metadata).model_dump(mode="json")
+
+        assert public["volume_measurement"] == encode_volume(volume)
+        assert public["volume_mm3"] == public["volume_measurement"]["value_mm3"]
+
+
 class TestBuildSystemConfig:
     def test_persists_the_requested_legacy_s3_root(self, db_session: Session) -> None:
         config = factories.build_system_config(
@@ -204,6 +235,11 @@ class TestBuildModel:
 
 
 class TestBuildFile:
+    def test_unopened_artifact_has_no_viewer_demand(self, db_session):
+        artifact = factories.build_file(db_session, factories.build_model(db_session))
+
+        assert artifact.viewer_requested_at is None
+
     def test_takes_the_models_next_version(self, db_session: Session) -> None:
         model = factories.build_model(db_session)
 
@@ -929,3 +965,90 @@ class TestGroupRegeneration:
             db_session, definitions=[JobKind.DERIVATIVES_GCODE]
         )
         assert regenerations(db_session, definitions=[JobKind.DERIVATIVES_MESH]) == {}
+
+
+class TestBuildIngestionEntry:
+    def test_freezes_a_pending_unit_for_the_job(self, db_session):
+        from app.db.models import IngestionEntryState
+        from app.modules.ingestion import batch_store
+        from app.modules.ingestion.batch_contracts import (
+            EntrySpec,
+            JobBatch,
+            LocalSource,
+        )
+
+        job = factories.build_job(db_session)
+        entry = factories.build_ingestion_entry(
+            db_session,
+            job,
+            identity="factory-frozen-source",
+            display_name="parts/tetra.stl",
+        )
+
+        records = batch_store.results(JobBatch(job.id), limit=1)
+
+        assert len(records) == 1
+        assert records[0].id == entry.id
+        assert records[0].spec == EntrySpec(
+            "factory-frozen-source", "parts/tetra.stl", LocalSource("factory"), None
+        )
+        assert records[0].state is IngestionEntryState.PENDING
+
+
+class TestStoragePublicationFactories:
+    def test_locator_factory_matches_the_production_exclusion_identity(
+        self, db_session
+    ):
+        from app.db.models import StoragePublicationLocator
+        from app.modules.storage.storage_publication import lock_publication_locator
+
+        anchor = factories.build_storage_publication_locator(db_session)
+
+        lock_publication_locator(
+            db_session,
+            backend=anchor.backend,
+            namespace=anchor.namespace,
+            key=anchor.key,
+        )
+
+        current = db_session.exec(select(StoragePublicationLocator)).one()
+        assert current.id == anchor.id
+        assert (current.backend, current.namespace, current.key) == (
+            anchor.backend,
+            anchor.namespace,
+            anchor.key,
+        )
+
+    def test_owned_factory_generates_distinct_publication_authority(self, db_session):
+        from app.modules.storage.storage_publication import PublicationReservation
+
+        first = factories.build_owned_storage_object(db_session, key="factory/first")
+        second = factories.build_owned_storage_object(db_session, key="factory/second")
+
+        assert (
+            PublicationReservation.of(first).generation
+            != PublicationReservation.of(second).generation
+        )
+
+
+class TestBuildIngestionScratchWindow:
+    def test_defaults_to_uncharged_preparing_custody(self, db_session, tmp_path):
+        from app.db.models import CapacityReservation
+        from app.db.models.ingestion_scratch import ScratchWindowPhase
+
+        row = factories.build_ingestion_scratch_window(
+            db_session, directory=tmp_path / "window"
+        )
+
+        assert row.phase is ScratchWindowPhase.PREPARING
+        assert row.device is None and row.inode is None
+        assert not (tmp_path / "window").exists()
+        assert db_session.get(CapacityReservation, row.capacity_operation_id) is None
+
+    def test_rejects_job_owner_without_execution_epoch(self, db_session, tmp_path):
+        job = factories.build_job(db_session)
+
+        with pytest.raises(ValueError, match="execution epoch"):
+            factories.build_ingestion_scratch_window(
+                db_session, directory=tmp_path / "window", job=job
+            )

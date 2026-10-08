@@ -54,6 +54,48 @@ def _api_run(
 
 
 class TestQuickGate:
+    def test_qualifies_viewer_pilot_in_browser_gate(self) -> None:
+        job = _workflow("ci.yml")["jobs"]["browser-smoke"]
+        step = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Verify representation pilot safety contracts"
+        )
+
+        assert (
+            "npm ci --prefix frontend/scripts/viewer-representation-pilot"
+            in step["run"]
+        )
+        assert (
+            "node --test frontend/scripts/viewer-representation-pilot.test.mjs"
+            in step["run"]
+        )
+        assert "playwright/cli.js install --with-deps chromium" in step["run"]
+        assert step["env"]["PLAYWRIGHT_SKIP_BROWSER_GC"] == "1"
+        assert not step.get("continue-on-error", False)
+        assert not job.get("continue-on-error", False)
+
+    def test_provisions_real_pid_namespace_qualification(self) -> None:
+        steps = _workflow("ci.yml")["jobs"]["backend"]["steps"]
+        provision = next(
+            step
+            for step in steps
+            if step.get("name") == "Prepare PID namespace qualification"
+        )
+        assert provision["if"] == "matrix.suite == 'integration-platform'"
+        assert "kernel.apparmor_restrict_unprivileged_userns=0" in provision["run"]
+        assert (
+            "unshare --user --map-root-user --pid --fork /usr/bin/true"
+            in provision["run"]
+        )
+        assert not provision.get("continue-on-error", False)
+        test_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Test backend once without external resources"
+        )
+        assert steps.index(provision) < test_index
+
     def test_propagates_required_job_failure(self) -> None:
         jobs = _workflow("ci.yml")["jobs"]
         gate = jobs["gate"]
@@ -157,13 +199,191 @@ class TestQuickGate:
 
     def test_keeps_required_check_present_on_every_pr(self) -> None:
         workflow = _workflow("ci.yml")
-        assert set(workflow[True]) == {"pull_request", "push", "merge_group", "workflow_dispatch"}
+        assert set(workflow[True]) == {
+            "pull_request",
+            "push",
+            "merge_group",
+            "workflow_dispatch",
+        }
         assert workflow[True]["pull_request"] is None
         assert workflow["env"]["OPENBLAS_NUM_THREADS"] == "1"
         assert "gate" in workflow["jobs"]
 
 
 class TestDeepSuite:
+    def test_runs_compatibility_phases_independently(self) -> None:
+        job = _workflow("deep-ci.yml")["jobs"]["backend-python314"]
+
+        assert job["strategy"]["matrix"]["phase"] == ["full-ordinary", "full-resources"]
+        assert job["strategy"]["fail-fast"] is False
+        assert job["timeout-minutes"] == 60
+        assert "./scripts/test.sh ${{ matrix.phase }} -q" in _commands(job)
+        assert not job.get("continue-on-error", False)
+
+    @pytest.mark.parametrize(
+        ("lane", "expected_parallel", "expression"),
+        [
+            pytest.param(
+                "full-ordinary",
+                ["-n", "auto", "--dist", "worksteal"],
+                "not coverage_gate and not scale and not postgres and not s3 and not remote_storage and not bgcode and not native_host",
+                id="ordinary",
+            ),
+            pytest.param(
+                "full-resources",
+                [],
+                "(postgres or s3 or remote_storage or bgcode or native_host) and not coverage_gate and not scale",
+                id="resources",
+            ),
+        ],
+    )
+    def test_selects_the_full_phase_in_one_invocation(
+        self, tmp_path: Path, lane: str, expected_parallel: list[str], expression: str
+    ) -> None:
+        fake_uv = tmp_path / "uv"
+        fake_uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        fake_uv.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", "scripts/test.sh", lane, "-q"],
+            cwd=REPO_ROOT / "backend",
+            env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        assert result.stdout.splitlines() == [
+            "run",
+            "pytest",
+            *expected_parallel,
+            "-m",
+            expression,
+            "tests",
+            "-q",
+        ]
+
+    def test_measures_host_native_fairness_in_the_serial_coverage_phase(self, tmp_path):
+        fake_uv = tmp_path / "uv"
+        record = tmp_path / "commands.jsonl"
+        fake_uv.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "with open(os.environ['UV_RECORD'], 'a') as f:\n"
+            "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        )
+        fake_uv.chmod(0o755)
+        subprocess.run(
+            ["bash", "scripts/test.sh", "coverage", "-q"],
+            cwd=REPO_ROOT / "backend",
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+                "UV_RECORD": str(record),
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commands = [json.loads(line) for line in record.read_text().splitlines()]
+        assert len(commands) == 3
+        ordinary, resources, gate = commands
+        assert "not native_host" in ordinary[ordinary.index("-m") + 1]
+        assert "native_host" in resources[resources.index("-m") + 1]
+        assert "-n" not in resources
+        assert "--cov" in resources
+        assert "--cov-append" in resources
+        assert "tests/repo/test_coverage_floors.py" in gate
+
+    def test_selects_host_native_fairness_by_its_resource_marker(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:randomly",
+                "-m",
+                "native_host",
+                "tests/e2e/test_ingestion_fairness.py",
+            ],
+            cwd=REPO_ROOT / "backend",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (
+            "TestIngestionFairness::test_backfill_progresses_during_sustained_interactive_arrivals"
+            in result.stdout
+        )
+        assert (
+            "TestIngestionFairness::test_full_capacity_backfill_eventually_completes"
+            in result.stdout
+        )
+        assert "2 tests collected" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("job_name", "suite_name"),
+        [
+            ("backend", "Test backend"),
+            ("backend-python314", "Run backend compatibility suite"),
+        ],
+    )
+    def test_provisions_real_pid_namespaces_for_each_full_suite(
+        self, job_name: str, suite_name: str
+    ) -> None:
+        job = _workflow("deep-ci.yml")["jobs"][job_name]
+        steps = job["steps"]
+        prepare = next(
+            step
+            for step in steps
+            if step.get("name") == "Prepare PID namespace qualification"
+        )
+        suite = next(step for step in steps if step.get("name") == suite_name)
+        cleanup = next(
+            step
+            for step in steps
+            if step.get("name") == "Remove PID namespace qualification"
+        )
+
+        assert job["runs-on"] == "ubuntu-latest"
+        assert job["defaults"]["run"]["working-directory"] == "backend"
+        assert prepare["run"] == "bash ../scripts/prepare-ci-pid-namespace.sh prepare"
+        assert "if" not in prepare
+        assert not prepare.get("continue-on-error", False)
+        assert not job.get("continue-on-error", False)
+        assert steps.index(prepare) < steps.index(suite) < steps.index(cleanup)
+        assert cleanup["if"] == "always()"
+        assert cleanup["run"] == "bash ../scripts/prepare-ci-pid-namespace.sh cleanup"
+        assert not cleanup.get("continue-on-error", False)
+
+    def test_namespace_preparation_preserves_the_host_restriction(self) -> None:
+        script = (REPO_ROOT / "scripts/prepare-ci-pid-namespace.sh").read_text()
+
+        assert "install -D -m 0755 /usr/bin/unshare" in script
+        assert 'profile printstash-ci-pid-namespace "$namespace_dir/unshare"' in script
+        assert "abi <abi/4.0>," in script
+        assert "flags=(unconfined) {\n  userns,\n}" in script
+        assert 'sudo apparmor_parser -r "$namespace_profile"' in script
+        assert 'sudo apparmor_parser -R "$namespace_profile"' in script
+        assert "sysctl" not in script
+        assert "aa-disable" not in script
+
+    def test_namespace_preparation_requires_a_successful_probe(self) -> None:
+        script = (REPO_ROOT / "scripts/prepare-ci-pid-namespace.sh").read_text()
+
+        assert "set -euo pipefail" in script
+        assert "|| true" not in script
+        probe = (
+            '"$namespace_dir/unshare" --user --map-root-user --pid --fork /usr/bin/true'
+        )
+        export = 'printf \'%s\\n\' "$namespace_dir" >> "$GITHUB_PATH"'
+        assert script.index("    fi\n    # This is mandatory") < script.index(probe)
+        assert script.index(probe) < script.index(export)
+
     def test_gates_mesh_resources_on_both_native_architectures(self):
         job = _workflow("deep-ci.yml")["jobs"]["mesh-resources"]
         rows = job["strategy"]["matrix"]["include"]
@@ -305,13 +525,8 @@ class TestDeepSuite:
             for step in steps
             if step.get("name") == "Coverage gate for the autonomous package"
         )
-        assert (
-            regular["if"] == "matrix.python != '3.11' || matrix.resolution != 'highest'"
-        )
-        assert (
-            coverage["if"]
-            == "matrix.python == '3.11' && matrix.resolution == 'highest'"
-        )
+        assert regular["if"] == "matrix.resolution != 'highest'"
+        assert coverage["if"] == "matrix.resolution == 'highest'"
 
 
 class TestPublicationGuards:

@@ -1,0 +1,6 @@
+复盘验证记录
+1. SQLite 读取：rounds=303；Harness=Trae；effectiveRoundsEvidence.source=count-trae-cn-steps.py；scope=latest_turn；effectiveRounds=303；syncRevision=7。
+2. 代码工作树 HEAD=b6dfda1a42792bc040c84c17ba861bbbba334d99；模型改动集中在 ShareLinkPin、revision share API、GC hold、trash purge、migration 和公开路由。
+3. 原始 Trae 轨迹 session-a8741f2019c90603.md 记录 revision share 集成/API/GC 测试通过，相关前端 vitest 27/27 通过；Node 22 与仓库 Node 24 要求造成的全套前端环境失败被单独记录。
+4. 当前 Windows 直接 pytest 复跑被 backend/app/modules/ingestion/scratch_windows.py 的 fcntl 导入阻断；该阻断来自 Windows 运行时。
+5. 代码审计复现确定缺口：_cover_snapshot 只写 cover_file_id，_snapshot_pins 只处理 revision_file_ids；file_is_held、active_hold_file_ids_select、hard_delete_file 均只看 ShareLinkPin，因此未选中的封面文件不受活动 share hold 保护。

@@ -41,9 +41,24 @@ function aGcode(over: Partial<FileRead> = {}): FileRead {
     revision_status: null,
     revision_notes: null,
     is_recommended: false,
+    is_external: false,
     uploaded_at: FROZEN_NOW,
     metadata: null,
     tags: [],
+    ...over,
+  };
+}
+
+function aMesh(over: Partial<FileRead> = {}): FileRead {
+  return {
+    ...aGcode({
+      id: 10,
+      original_filename: "part.stl",
+      file_type: "stl",
+      version: 1,
+      sha256: "a".repeat(64),
+      revision_label: null,
+    }),
     ...over,
   };
 }
@@ -68,11 +83,15 @@ function aShareLink(over: Partial<ShareLinkRead> = {}): ShareLinkRead {
  * The distinction is the point: the link is shown once, at creation, and never
  * retrievable afterwards.
  */
-function aCreatedShareLink(over: Partial<ShareLinkCreated> = {}): ShareLinkCreated {
+function aCreatedShareLink(
+  over: Partial<ShareLinkCreated> = {},
+): ShareLinkCreated {
   return { ...aShareLink(), token: "abc123", url: "/share/abc123", ...over };
 }
 
-function renderShare(options: RenderAppOptions & { files?: FileRead[]; open?: boolean } = {}) {
+function renderShare(
+  options: RenderAppOptions & { files?: FileRead[]; open?: boolean } = {},
+) {
   const { files = [aGcode()], open = true, routes = {}, ...rest } = options;
   const onClose = vi.fn<() => void>();
   const result = renderApp(
@@ -112,7 +131,9 @@ describe("ShareDialog", () => {
     });
 
     it("lists the links already granted", async () => {
-      renderShare({ routes: { "GET /api/v1/models/1/shares": json([aShareLink()]) } });
+      renderShare({
+        routes: { "GET /api/v1/models/1/shares": json([aShareLink()]) },
+      });
 
       await screen.findByRole("dialog");
       // "Active · view-only · all revs" — one line describing the whole grant.
@@ -122,7 +143,9 @@ describe("ShareDialog", () => {
     it("says so when nothing has been shared yet", async () => {
       renderShare();
 
-      expect(await screen.findByText("No share links yet.")).toBeInTheDocument();
+      expect(
+        await screen.findByText("No share links yet."),
+      ).toBeInTheDocument();
     });
 
     it("marks a revoked link as such", async () => {
@@ -148,10 +171,14 @@ describe("ShareDialog", () => {
       const { requestsWithMethod } = renderShare();
       await screen.findByRole("dialog");
 
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       await waitFor(() =>
-        expect(JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}")).toMatchObject({
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
           allow_download: false,
         }),
       );
@@ -163,10 +190,14 @@ describe("ShareDialog", () => {
       await screen.findByRole("dialog");
       await user.click(screen.getByRole("checkbox", { name: /download/i }));
 
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       await waitFor(() =>
-        expect(JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}")).toMatchObject({
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
           allow_download: true,
         }),
       );
@@ -179,10 +210,14 @@ describe("ShareDialog", () => {
       const { requestsWithMethod } = renderShare();
       await screen.findByRole("dialog");
 
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       await waitFor(() =>
-        expect(JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}")).toMatchObject({
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
           expires_in_days: 7,
         }),
       );
@@ -195,10 +230,14 @@ describe("ShareDialog", () => {
       });
       await screen.findByRole("dialog");
 
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       // In a read-only box, so the user copies it rather than retyping it.
-      expect(await screen.findByDisplayValue(/\/share\/abc123/)).toBeInTheDocument();
+      expect(
+        await screen.findByDisplayValue(/\/share\/abc123/),
+      ).toBeInTheDocument();
     });
   });
 
@@ -216,9 +255,11 @@ describe("ShareDialog", () => {
       await user.click(await screen.findByRole("button", { name: /Revoke/ }));
 
       await waitFor(() =>
-        expect(requestsWithMethod("DELETE").some((call) => call.url.includes("/shares/1"))).toBe(
-          true,
-        ),
+        expect(
+          requestsWithMethod("DELETE").some((call) =>
+            call.url.includes("/shares/1"),
+          ),
+        ).toBe(true),
       );
     });
   });
@@ -242,47 +283,105 @@ describe("ShareDialog", () => {
       const { requestsWithMethod } = renderShare();
       await screen.findByRole("dialog");
 
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       await waitFor(() =>
-        expect(JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}")).toMatchObject({
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
           revision_file_ids: null,
         }),
       );
     });
 
-    it("shares only the revisions the user ticked", async () => {
-      // A user sharing one tested revision does not want the failed ones going
-      // with it.
+    it("shares only the files and revisions the user ticked", async () => {
+      // A precise link pins exact identities: the checked mesh and the one
+      // checked G-code revision, never the others.
       const user = userEvent.setup();
       const { requestsWithMethod } = renderShare({
-        files: [aGcode(), aGcode({ id: 21, gcode_revision_number: 2 })],
+        files: [
+          aMesh(),
+          aGcode({ id: 20, gcode_revision_number: 1 }),
+          aGcode({ id: 21, gcode_revision_number: 2 }),
+        ],
       });
       await screen.findByRole("dialog");
-      await user.click(screen.getByRole("button", { name: "Selected revisions" }));
+      await user.click(
+        screen.getByRole("button", { name: "Selected revisions" }),
+      );
 
+      // Checkboxes: [0] allow download, [1] the mesh, [2] rev 1, [3] rev 2.
       await user.click(screen.getAllByRole("checkbox")[1]);
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(screen.getAllByRole("checkbox")[2]);
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
 
       await waitFor(() =>
-        expect(JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}")).toMatchObject({
-          revision_file_ids: [20],
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
+          revision_file_ids: [10, 20],
+        }),
+      );
+    });
+
+    it("pre-ticks every mesh and the latest revision when the panel opens", async () => {
+      // The precise link names meshes explicitly now — pinning only a G-code
+      // would hide the 3D model — so the common selection is the default,
+      // applied as the dialog transitions from closed to open (real usage).
+      const user = userEvent.setup();
+      const files = [aMesh(), aGcode({ id: 20 }), aGcode({ id: 21 })];
+      const { requestsWithMethod, rerender } = renderShare({
+        open: false,
+        files,
+      });
+      expect(screen.queryByRole("dialog")).toBeNull();
+
+      rerender(
+        <ShareDialog
+          modelId={1}
+          files={files}
+          open
+          onClose={vi.fn<() => void>()}
+        />,
+      );
+      await screen.findByRole("dialog");
+      await user.click(
+        screen.getByRole("button", { name: "Selected revisions" }),
+      );
+      expect(screen.getAllByRole("checkbox")[1]).toBeChecked();
+      expect(screen.getAllByRole("checkbox")[3]).toBeChecked();
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
+
+      await waitFor(() =>
+        expect(
+          JSON.parse(requestsWithMethod("POST").at(-1)?.body ?? "{}"),
+        ).toMatchObject({
+          revision_file_ids: [10, 21],
         }),
       );
     });
 
     it("cannot create a scoped link with nothing ticked", async () => {
-      // A link scoped to no revisions grants nothing; creating one is a link the
+      // A link scoped to no files grants nothing; creating one is a link the
       // recipient reports as broken.
       const user = userEvent.setup();
-      renderShare();
+      renderShare({
+        files: [aMesh(), aGcode({ id: 20 }), aGcode({ id: 21 })],
+      });
       await screen.findByRole("dialog");
-      await user.click(screen.getByRole("button", { name: "Selected revisions" }));
-      await user.click(screen.getAllByRole("checkbox")[1]);
+      await user.click(
+        screen.getByRole("button", { name: "Selected revisions" }),
+      );
 
-      await user.click(screen.getAllByRole("checkbox")[1]);
-
-      expect(screen.getByRole("button", { name: /Create link|Create/ })).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      ).toBeDisabled();
     });
 
     it("says how many revisions an existing link covers", async () => {
@@ -290,7 +389,9 @@ describe("ShareDialog", () => {
       // the only place the difference shows.
       renderShare({
         routes: {
-          "GET /api/v1/models/1/shares": json([aShareLink({ revision_file_ids: [20, 21] })]),
+          "GET /api/v1/models/1/shares": json([
+            aShareLink({ revision_file_ids: [20, 21] }),
+          ]),
         },
       });
 
@@ -307,7 +408,9 @@ describe("ShareDialog", () => {
       const user = userEvent.setup();
       renderShare();
       await screen.findByRole("dialog");
-      await user.click(screen.getByRole("button", { name: /Create link|Create/ }));
+      await user.click(
+        screen.getByRole("button", { name: /Create link|Create/ }),
+      );
       await screen.findByDisplayValue(/\/share\/abc123/);
 
       // The copy control sits immediately after the read-only token box; it
@@ -315,7 +418,8 @@ describe("ShareDialog", () => {
       // SAFETY: the sibling is that button — the box is rendered only inside the
       // created-link row, which is the row this test just made appear.
       await user.click(
-        screen.getByDisplayValue(/\/share\/abc123/).nextElementSibling as HTMLElement,
+        screen.getByDisplayValue(/\/share\/abc123/)
+          .nextElementSibling as HTMLElement,
       );
 
       await waitFor(async () =>

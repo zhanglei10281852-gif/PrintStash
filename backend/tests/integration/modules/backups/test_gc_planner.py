@@ -25,13 +25,16 @@ from app.core.time import utcnow
 from app.db.models import (
     Document,
     DocumentKind,
+    File,
     FileType,
     GcRun,
     GcRunState,
     Model,
     RestoreMarker,
+    ShareLinkPin,
 )
 from app.modules.backups import gc_planner
+from app.modules.identity import share
 from app.modules.storage.storage_backend.contracts import StorageTier
 from app.modules.storage.storage_backend.s3 import S3StorageBackend
 from app.modules.storage.storage_identity import independent_evidence, s3_target
@@ -921,7 +924,7 @@ class TestFinalizeGcPlan:
         monkeypatch.setattr(gc_planner, "_resource", lambda *_args: resource)
         monkeypatch.setattr(
             f"app.modules.library.trash.{function_name}",
-            lambda _session, row: called.append(row),
+            lambda _session, row, *, prepared_deletions: called.append(row),
         )
         monkeypatch.setattr(
             "app.modules.storage.storage_deletion.process_storage_delete_intents",
@@ -1429,3 +1432,126 @@ class TestOpenDalS3Witness:
 
         monkeypatch.setattr(backup_verification, "verify_backup", verify)
         assert gc_planner.find_backup_witness() is None
+
+
+class TestRevisionShareHoldsInPlans:
+    """A planned candidate that becomes held cannot be finalized."""
+
+    def _live_file(self, session: Session, slug: str, model: Model | None = None) -> File:
+        owner = model or build_model(session, name=slug, slug=slug)
+        return build_file(
+            session,
+            owner,
+            filename=f"{slug}.stl",
+            size_bytes=10,
+            file_type=FileType.STL,
+        )
+
+    def _pin(self, session: Session, file_row: File):
+        return share.create_share(
+            session,
+            model_id=file_row.model_id,
+            expires_in_days=7,
+            allow_download=False,
+            revision_file_ids=[file_row.id],
+            created_by=None,
+        )
+
+    def test_preview_excludes_a_held_file(self, db_session: Session) -> None:
+        held = self._live_file(db_session, "plan-held-file")
+        self._pin(db_session, held)
+        held.deleted_at = utcnow() - timedelta(days=31)
+        db_session.add(held)
+        db_session.commit()
+
+        run = gc_planner.create_plan(
+            db_session, retention_days=30, requested_by=None
+        )
+
+        assert run.resource_count == 0
+        assert run.candidate_pool_count == 0
+        assert db_session.get(File, held.id) is not None
+
+    def test_preview_excludes_a_model_with_a_held_file(
+        self, db_session
+    ) -> None:
+        held_model = build_model(
+            db_session, name="plan-held-model", slug="plan-held-model"
+        )
+        held = self._live_file(db_session, "plan-held-file-1", held_model)
+        self._pin(db_session, held)
+        held_model.deleted_at = utcnow() - timedelta(days=31)
+        other = _expired_model(db_session, "plan-held-other")
+        db_session.add(held_model)
+        db_session.commit()
+
+        run = gc_planner.create_plan(
+            db_session, retention_days=30, requested_by=None
+        )
+
+        items = gc_planner._items(db_session, int(run.id))  # noqa: SLF001
+        assert [(item.resource_kind, item.resource_id) for item in items] == [
+            ("model", other.id)
+        ]
+        assert db_session.get(Model, held_model.id) is not None
+
+    def test_candidate_returns_to_the_pool_after_revocation(
+        self, db_session
+    ) -> None:
+        held = self._live_file(db_session, "plan-released")
+        link, _ = self._pin(db_session, held)
+        held.deleted_at = utcnow() - timedelta(days=31)
+        db_session.add(held)
+        db_session.commit()
+        run = gc_planner.create_plan(
+            db_session, retention_days=30, requested_by=None
+        )
+        assert run.resource_count == 0
+        gc_planner.abort_plan(db_session, int(run.id))
+
+        share.revoke_share(db_session, link)
+        reopened = gc_planner.create_plan(
+            db_session, retention_days=30, requested_by=None
+        )
+
+        items = gc_planner._items(db_session, int(reopened.id))  # noqa: SLF001
+        assert [(item.resource_kind, item.resource_id) for item in items] == [
+            ("file", held.id)
+        ]
+
+    def test_revalidation_refuses_a_candidate_that_became_held(
+        self, db_session
+    ) -> None:
+        # Plan the expired file while nothing holds it, then mint the hold
+        # directly at the catalog level (the race the guard exists for) before
+        # revalidation.
+        held = self._live_file(db_session, "plan-revalidate")
+        held.deleted_at = utcnow() - timedelta(days=31)
+        db_session.add(held)
+        db_session.commit()
+        run = gc_planner.create_plan(
+            db_session, retention_days=30, requested_by=None
+        )
+        link, _ = share.create_share(
+            db_session,
+            model_id=held.model_id,
+            expires_in_days=7,
+            allow_download=False,
+            created_by=None,
+        )
+        db_session.add(
+            ShareLinkPin(
+                share_link_id=int(link.id),
+                file_id=held.id,
+                sha256=held.sha256,
+                file_type=FileType.STL,
+                original_filename=held.original_filename,
+                file_version=held.version,
+            )
+        )
+        db_session.commit()
+
+        items = gc_planner._items(db_session, int(run.id))  # noqa: SLF001
+        with pytest.raises(gc_planner.GcSafetyError, match="gc_candidate_held"):
+            gc_planner._revalidate_plan(db_session, run)  # noqa: SLF001
+        assert items[0].resource_id == held.id

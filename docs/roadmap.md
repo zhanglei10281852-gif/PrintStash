@@ -34,7 +34,7 @@ Developed features in the current app:
   or read-only S3/WebDAV/SFTP/Google Drive namespaces, with bounded discovery,
   durable cursors, tombstones, per-source scheduling, and local-only event
   watching
-- Public, expiring, read-only share links to a single model (view-only by default; opt-in original-file download)
+- Public, expiring share links to a single model: view-only by default with opt-in original-file download, or pinned to the exact selected G-code and STL revisions — pinned revisions keep serving while trashed and are exempt from storage reclamation until the link expires or is revoked
 - Print statistics dashboard (cost, filament, prints, print time; time series + top collections/filaments) with a configurable display currency
 - Measured prints: real filament + duration and per-print cost captured from Moonraker, with auto known-good revision promotion
 - G-code parser coverage for OrcaSlicer, PrusaSlicer, Bambu Studio, Cura, and Klipper/Orca samples, including PrusaSlicer binary G-code (`.bgcode`) metadata and thumbnails

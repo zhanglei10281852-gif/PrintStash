@@ -23,8 +23,6 @@ from app.modules.identity import rbac, share
 from app.modules.storage.artifact_delivery import DeliveryPurpose
 from app.schemas.share import ShareLinkCreate, ShareLinkCreated, ShareLinkRead
 
-_MESH_TYPES = {FileType.STL, FileType.THREE_MF, FileType.OBJ, FileType.STEP}
-
 
 # ---------------------------------------------------------------------------
 # Public router — unauthenticated, GET only. Rate-limited per IP as
@@ -40,9 +38,9 @@ router = APIRouter(
 
 @router.get("/{token}", summary="Public read-only view of a shared model")
 def get_shared_model(token: str, session: Session = Depends(get_session)):
-    link = share.resolve_share(session, token)
-    share.record_access(session, link)
-    return share.public_detail(session, link)
+    access = share.resolve_share_access(session, token)
+    share.record_access(session, access.link)
+    return share.public_detail(session, access)
 
 
 @router.get("/{token}/thumbnail", summary="Thumbnail of a shared model")
@@ -51,14 +49,14 @@ def get_shared_thumbnail(
     request: Request,
     session: Session = Depends(get_session),
 ):
-    link = share.resolve_share(session, token)
-    model = session.get(Model, link.model_id)
-    if model is None or model.thumbnail_file_id is None:
+    access = share.resolve_share_access(session, token)
+    cover_file_id, cover_path = share.shared_thumbnail_target(session, access)
+    if cover_file_id is None and not cover_path:
         raise HTTPException(status_code=404, detail="not_found")
     return thumbnail_response(
-        model.thumbnail_file_id,
+        cover_file_id,
         request,
-        thumbnail_path=model.thumbnail_path,
+        thumbnail_path=cover_path,
         purpose=DeliveryPurpose.PUBLIC_SHARE,
     )
 
@@ -73,11 +71,11 @@ def get_shared_stl(
     request: Request,
     session: Session = Depends(get_session),
 ):
-    link = share.resolve_share(session, token)
-    f = share.share_file_or_404(session, link, file_id)
-    if f.file_type not in _MESH_TYPES:
-        raise HTTPException(status_code=404, detail="not_found")
-    return stl_response(f, request, DeliveryPurpose.PUBLIC_SHARE)
+    access = share.resolve_share_access(session, token)
+    f = share.authorize_shared_file(
+        session, access, file_id, file_types=share.MESH_TYPES
+    )
+    return stl_response(session, f, request, DeliveryPurpose.PUBLIC_SHARE)
 
 
 @router.get(
@@ -90,10 +88,10 @@ def download_shared_file(
     file_id: int,
     session: Session = Depends(get_session),
 ):
-    link = share.resolve_share(session, token)
-    if not link.allow_download:
+    access = share.resolve_share_access(session, token)
+    f = share.authorize_shared_file(session, access, file_id)
+    if not access.link.allow_download:
         raise HTTPException(status_code=403, detail="download_disabled")
-    f = share.share_file_or_404(session, link, file_id)
     return serve_artifact(
         f, request, f.original_filename, purpose=DeliveryPurpose.PUBLIC_SHARE
     )
@@ -109,11 +107,11 @@ def get_shared_gcode(
     file_id: int,
     session: Session = Depends(get_session),
 ):
-    link = share.resolve_share(session, token)
-    f = share.share_file_or_404(session, link, file_id)
-    if f.file_type != FileType.GCODE:
-        raise HTTPException(status_code=404, detail="not_found")
-    if not link.allow_download:
+    access = share.resolve_share_access(session, token)
+    f = share.authorize_shared_file(
+        session, access, file_id, file_types=frozenset({FileType.GCODE})
+    )
+    if not access.link.allow_download:
         raise HTTPException(status_code=403, detail="download_disabled")
     return serve_artifact(
         f, request, f.original_filename, "text/plain", DeliveryPurpose.PUBLIC_SHARE
@@ -157,7 +155,7 @@ def create_model_share(
         revision_file_ids=body.revision_file_ids,
         created_by=current_user.id,
     )
-    read = share.to_read(link)
+    read = share.to_read(link, share.list_pins(session, int(link.id)))
     return ShareLinkCreated(
         **read.model_dump(), token=raw_token, url=f"/share/{raw_token}"
     )
@@ -174,7 +172,11 @@ def list_model_shares(
     session: Session = Depends(get_session),
 ) -> list[ShareLinkRead]:
     _require_model(session, current_user, model_id, CollectionRole.VIEW)
-    return [share.to_read(link) for link in share.list_shares(session, model_id)]
+    links = share.list_shares(session, model_id)
+    pins_by_link = share.list_pins_for_links(session, links)
+    return [
+        share.to_read(link, pins_by_link.get(int(link.id), ())) for link in links
+    ]
 
 
 @admin_router.delete(
@@ -191,7 +193,10 @@ def revoke_model_share(
     if link is None:
         raise HTTPException(status_code=404, detail="share_not_found")
     _require_model(session, current_user, link.model_id, CollectionRole.EDIT)
-    return share.to_read(share.revoke_share(session, link))
+    return share.to_read(
+        share.revoke_share(session, link),
+        share.list_pins(session, int(link.id)),
+    )
 
 
 @router.get(
@@ -205,8 +210,10 @@ def get_shared_toolpath(
 ):
     from app.api.toolpath_response import toolpath_response
 
-    link = share.resolve_share(session, token)
-    if not link.allow_download:
+    access = share.resolve_share_access(session, token)
+    file = share.authorize_shared_file(
+        session, access, file_id, file_types=frozenset({FileType.GCODE})
+    )
+    if not access.link.allow_download:
         raise HTTPException(status_code=403, detail="download_disabled")
-    file = share.share_file_or_404(session, link, file_id)
     return toolpath_response(session, file)
