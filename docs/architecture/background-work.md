@@ -35,8 +35,9 @@ a port. Why it is shaped this way is in
 | Fence | `work.fences` | A database lease (holder, heartbeat, TTL) checked before every step; restore and migrations hold them. |
 | Executor | `work.executors` | A process that runs Jobs, heartbeating its role, lanes and in-flight writes. |
 
-Kinds, lanes, states and priorities are closed sets: enums in
-`db.models.types`, stored as TEXT with a CHECK constraint listing their values
+Kinds, lanes, states and priorities are closed sets. `core.work_priority` owns
+`WorkPriority`; `db.models.types` re-exports it with the other enums. They are
+stored as TEXT with a CHECK constraint listing their values
 (no database-native enum types, see the database skill reference). A kind
 with no member cannot be declared, recorded or requested, and
 `tests/integration/bootstrap/test_work.py` fails when a member has no
@@ -52,7 +53,7 @@ The port (`work.contracts.JobEngine`) executes two kinds of submission, a
 `JobSubmission` (one attempt of one Job) and a `PassSubmission` (one reconcile
 pass over one source), and names exactly two guarantees, both provided by DBOS:
 
-- `execution_id = <job id>:<attempt>`: one execution per attempt, ever.
+- `execution_id = <job id>:<epoch>:<attempt>`: one execution per attempt and epoch, ever.
 - `dedupe_key = <definition>|<subject>`: at most one active execution per
   subject. A Job is routed either `Deduplicated` by that key or, on a
   partitioned lane, `Partitioned` by its definition's partition key (DBOS
@@ -76,8 +77,14 @@ One pass (`work.reconciler.run_pass`) per definition, claimed through its
    A Job resubmitted more than `JOBS_MAX_RESUBMITS` times fails.
 2. **Discover.** The source is asked for at most
    `min(JOBS_RECONCILE_BATCH, lane headroom)` items, where headroom is the
-   lane's concurrency × `JOBS_LANE_HEADROOM_FACTOR` minus its depth. Each item
-   becomes a Job (unless its subject already has one) and is submitted.
+   lane's concurrency × `JOBS_LANE_HEADROOM_FACTOR` minus its queued depth for
+   ordinary sources. Derivative sources receive explicit priority allowances:
+   interactive queued/interrupted Jobs are capped at lane concurrency; all
+   active backfill Jobs, including running ones, share one slot. Every
+   definition in a lane shares those caps. Each item becomes a Job (unless its
+   subject already has one) and is submitted. A short lane fence locks the
+   quota recheck and Job creation in the same transaction; engine submission
+   follows commit. A lost or expired holder cannot admit work.
 3. **Continue or stop.** A full batch that created Jobs while the lane still had
    room runs again immediately. A full lane stops; each Job's completion nudges
    its source. A nudge that arrived during the pass (the dirty mark,
@@ -88,6 +95,67 @@ already queued within `JOBS_SUBMIT_GRACE_SECONDS`. An interactive nudge is not
 absorbed by a queued backfill pass. The tick, a single persistent DBOS
 schedule, nudges every definition at `JOBS_RECONCILE_INTERVAL_SECONDS` as a
 safety net, and schedule sources become due on it.
+
+## Derivative scheduling
+
+`derive.native` and `derive.light` use one FIFO engine queue each, with equal
+engine ranks for both logical priorities. This gives admitted backfill a finite
+predecessor list under sustained uploads, while preserving each lane's
+concurrency, rate and partition limits. Their pending headroom is concurrency
+plus one; other lanes keep strict engine priority and the configured headroom
+multiplier. Logical priority remains on the Job and is bound around each actual
+step in its execution thread.
+
+Native CPU/RAM, prepared-source bytes and source I/O use shared physical
+resource pools. Interactive waiters precede unaged backfill; backfill waiting
+30 seconds joins the interactive rank in registration order, allowing a large
+claim to accumulate enough free capacity. Active work is never preempted.
+Waiting for capacity does not create a new Job or derivative attempt.
+
+Recovery selects one active backfill per shared FIFO lane, preferring running
+work, then already reserved or accepted epochs, then oldest unsubmitted intent. Other retained intents wait without spending attempts. The owner
+selection is cached for the repair batch and refreshed after its owner settles.
+If update ordering places that owner outside the ordinary page, repair includes
+at most one additional Job belonging to its own definition. This preserves the
+batch-plus-one bound and prevents retries from hiding the only admitted backfill.
+Before each backfill submission, a conditional owner UPDATE under the live lane
+fence commits its admission epoch without spending an attempt. Submission checks
+that exact current reservation before constructing engine arguments. An accepted
+execution whose attempt was not yet recorded retains its slot across a crash;
+terminal state or a public retry epoch change retires the old authority. The
+active-state predicate uses the existing partial active-subject index, so
+terminal Job history cannot enlarge discovery or quota scans.
+
+Before enabling FIFO consumers, startup refuses persisted derivation workflows
+with legacy engine ranks or queue state it cannot verify. Upgrades drain old
+producers and restart API and workers together, as described in the
+[upgrade guide](../../UPGRADE.md#unreleased-derivative-scheduling).
+
+## Batch imports
+
+Ingestion Job Definitions consume a durable source plan through `BatchSession`.
+`batch_contracts` owns typed source identities and outcomes; `batch_store` owns
+fenced SQL persistence. Source adapters materialize one disposable window, then
+use the canonical Artifact commit before releasing that window. An
+`IngestionEntry` success commits with the File, Metadata and provenance changes;
+reusing an existing File still records a distinct source receipt.
+
+A Job owns ordinary URL/archive entries. A Pending Import owns its entries
+across replacement retry Jobs. Writers check the exact execution attempt and
+epoch, plus the Pending Import's current Job. Registration order never enters a
+new entry's identity. Retry consults confirmed receipts before source I/O.
+Discovery totals stay unknown until expansion finishes, while processed and
+successful counters advance for each entry. Source failures remain separate
+from already committed Artifacts.
+
+Each import holds at most one expanded/copied disposable file. Downloaded
+archive containers and durable upload leases retain their own existing bounds.
+Cleanup failure must stop further materialization; it does not revoke an
+Artifact already committed. Derivatives can run through their existing Jobs
+while later source entries are processed. This does not introduce a second
+queue, concurrent SQL writers or parallel downloads.
+
+See the [bounded batch validation matrix](../testing/bounded-batch-imports.md).
 
 ## Derivatives
 
@@ -102,15 +170,60 @@ skipped, failed (with backoff) or cancelled.
 `work.events` publishes ids and a hint, never protected data:
 
 - `jobs:<user id>` for the owner's Jobs, `work:admin` for every Job;
-- `model:<id>` when a derivative of one of the Model's Artifacts changes.
+- `model:<id>` when a derivative of one of the Model's Artifacts changes;
+- `derivatives:policy` to every authenticated connection when the policy changes.
 
 `GET /api/v1/events/ws` (one-use ticket from `POST /api/v1/events/ticket`)
 delivers them. The client follows a Model with `{"subscribe": "model:<id>"}`;
 the server checks the viewer may see it and answers
 `{"type": "subscribed", "channel": "model:<id>"}`, the cue to refetch what
-changed before the subscription took effect. Delivery is best effort: in one
-process it is in memory, across processes it is PostgreSQL `NOTIFY`, and a
-reconnect delivers `{"type": "resync"}` so clients refetch.
+changed before the subscription took effect.
+
+Live delivery is best effort: in one process it is in memory, across processes
+it is PostgreSQL `NOTIFY`, and a dead socket or a restarted listener may drop a
+notice. Recovery does not wait for polling: every notice is first written to
+the durable `work_events` log **in the same transaction** as the Job or
+derivative change it describes, in one global `seq` order and one
+authorization scope (`job_owner`, `job_admin`, `model`, `policy`). On connect
+the server sends
+
+```json
+{"type": "hello", "head": 104, "floor": 71, "retention_seconds": 86400}
+```
+
+(the current log bounds) followed by a bare `{"type": "resync"}` so older
+builds keep refetching once. A client that stored its last `seq` (the cursor
+survives reload in `localStorage`) sends `{"replay_after": 104}` and receives
+one ordered page
+
+```json
+{"type": "replay", "events": [ … ], "next_cursor": 153, "has_more": true, "head": 210}
+```
+
+of what it missed across the scopes it holds *now*; it pages while
+`has_more`, merges each page with live frames that arrived meanwhile, and
+dedupes by `seq`, so live and replay never deliver one event twice. Every live
+notice carries the same `seq` its row was committed with.
+
+Replay is an authorization boundary, not just a read filter: the handler
+reloads the user, replays only owner/admin (superusers)/followed-Model/policy
+rows the connection can currently see, and answers an explicit resync instead
+of older or forbidden rows:
+
+- `{"type": "resync", "reason": "cursor_expired", "head": …}` — the cursor is
+  behind the retained floor;
+- `{"type": "resync", "reason": "cursor_ahead", "head": …}` — the cursor is
+  ahead of the log (a restored or replaced database has a younger sequence);
+- `{"type": "resync", "reason": "scope_revoked", "head": …}` — a followed
+  Model was trashed or the connection lost its collection role; that channel
+  is also unsubscribed server-side.
+
+On any resync the client refetches what it shows through the REST endpoints
+and restarts its cursor at `head`; REST stays the source of truth for cancel,
+retry and deletion. Rows are pruned after `WORK_EVENTS_RETENTION_HOURS` by the
+housekeeping Job, which advances the floor. No external queue is involved:
+SQLite is one process, and a split topology already requires PostgreSQL,
+whose sequence and `pg_notify` carry both the order and the live hint.
 
 ## Topologies
 
@@ -137,13 +250,14 @@ both Compose files run the first with no setting.
 | --- | --- | --- |
 | `JOBS_RECONCILE_INTERVAL_SECONDS` | 300 | Safety-net tick |
 | `JOBS_RECONCILE_BATCH` | 500 | Most Jobs one pass creates |
-| `JOBS_LANE_HEADROOM_FACTOR` | 2 | Queue depth allowed per unit of concurrency |
+| `JOBS_LANE_HEADROOM_FACTOR` | 2 | Pending depth multiplier for ordinary lanes; derivation lanes reserve concurrency plus one |
 | `JOBS_MAX_RESUBMITS` | 3 | Interrupted attempts before a Job fails |
 | `JOBS_RESUBMIT_COOLDOWN_SECONDS` / `JOBS_RESUBMIT_BURST` | 30 / 3 | A subject finished this often waits the window out |
 | `JOBS_SUBMIT_GRACE_SECONDS` | 60 | How long a queued pass absorbs further nudges |
 | `JOBS_EXECUTOR_STALE_SECONDS` | 120 | Heartbeat age after which an executor's work is rerun |
 | `JOBS_RETENTION_DAYS` / `JOBS_RETENTION_PER_USER` | 7 / 500 | User Job history |
 | `JOBS_SYSTEM_RETENTION_HOURS` | 24 | Ownerless (backfill) Job history |
+| `WORK_EVENTS_RETENTION_HOURS` | 24 | How long a work event stays replayable from a cursor; older cursors resync |
 | `ENGINE_HISTORY_RETENTION_DAYS` | 7 | Settled engine executions |
 | `DERIVATIVE_MAX_ATTEMPTS` / `DERIVATIVE_BACKOFF_SECONDS` | 5 / 30 | Derivative retries, doubling, capped at a day |
 | `FENCE_HEARTBEAT_SECONDS` / `FENCE_TTL_SECONDS` | 15 / 60 | Fence liveness |
@@ -153,9 +267,11 @@ both Compose files run the first with no setting.
 Administrators override lane concurrency at runtime on Settings → Background
 work; the override is stored in the database and applies to every process.
 
-Native memory is bounded by lanes: at most `derive.native` renders plus the
-`similarity` and `search` lanes' steps run at once, and each native child is
-killed past its memory budget. Within one process, local inference (embedding
+Native memory is bounded by shared CPU/RAM admission across API and worker
+processes, independent of lane count. A request reserves its complete geometry,
+raster and analysis profile; admitted credits remain held through descendant
+termination. Preparation separately reserves source-copy bytes and I/O slots.
+Each native child is killed past its memory budget. Within one process, local inference (embedding
 and search-view workers) is also admitted locally, up to `MAX_RENDER_JOBS` at
 once, because a search query embeds in the request, outside every lane: a
 waiting query goes first, and background inference that would wait yields
@@ -218,7 +334,9 @@ are only ever recognised by their heartbeat going stale.
   previous attempt left open.
 - **A nudge is lost.** Nothing happens until the next tick or completion nudge;
   the intent is still in the database.
-- **A notice is dropped.** Clients also refresh on a slow interval and on
+- **A notice is dropped.** Live delivery is best effort; the durable
+  `work_events` log fills the gap from the connection's cursor on reconnect
+  (or a NOTIFY re-listen), and clients also refetch on a slow interval and on
   `resync`.
 
 
@@ -271,3 +389,28 @@ is reset even when the step raises. Concurrent steps have independent probes.
 A forced check before accepting native output prevents a result finishing inside
 the normal 200 ms polling interval from publishing after observed withdrawal.
 The Job engine remains responsible for durable dispatch and settlement.
+
+
+### Execution authority across retry
+
+`Job.attempts` counts engine-accepted executions, including a worker that began
+before the submitter recorded acceptance. Explicit retry preserves this count
+and rotates `execution_epoch` atomically with the subject retry hook.
+`submitted_epoch` records the last accepted generation (null before the first
+submission). A mismatch is durable pending intent: reconciliation submits it
+immediately, even if the retry nudge was lost. It never treats that state as a
+lost execution or consumes the interruption budget.
+
+Engine identity is `Job ID:execution_epoch:attempt`. Both engines carry the epoch
+through begin, progress and settlement; legacy callbacks without an epoch are
+ignored. `JobStore.lock_execution` validates authority under the Job row lock.
+Failure hooks share the first terminal transaction; cleanup replay additionally
+checks epoch, attempt and terminal state, so it cannot reclaim retry-owned staging.
+Submission uses a snapshot, engine I/O, then a conditional database write. A late
+engine acknowledgement cannot overwrite a retry's count or timestamps.
+
+If the first submission of a new epoch is deduplicated, it checks the engine's
+active catalogue for obsolete executions of this subject's terminal Jobs or old
+epochs of the current Job, cancels those, and retries submission once. The engine
+port has no subject lookup; this catalogue read is limited to actual deduplication
+conflicts. Healthy submissions do not scan it. No database lock spans engine I/O.

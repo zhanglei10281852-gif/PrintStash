@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from printstash_core.mesh.measurements import VolumeMeasurement
 from printstash_core.search.passages import SearchSubject, SubjectType
 
 from app.db.models import (
@@ -46,11 +47,14 @@ from app.db.models import (
     InboxSourceKind,
     IndexGeneration,
     InferenceEndpoint,
+    IngestionScratchWindow,
     IngestRequest,
     IngestRequestKind,
     Job,
     JobKind,
     JobState,
+    MeshFingerprintContinuation,
+    Metadata,
     Model,
     ModelProvenanceSource,
     ModelSourceCover,
@@ -82,6 +86,7 @@ from app.db.models import (
     SimilarityRun,
     StorageConnection,
     StorageConnectionPurpose,
+    StoragePublicationLocator,
     SubjectCaption,
     SystemConfig,
     Tag,
@@ -93,6 +98,8 @@ from app.db.models import (
     VaultGeneration,
     VaultMigrationObject,
     VaultMigrationRun,
+    WorkEvent,
+    WorkEventScope,
     WorkExecutor,
     WorkFence,
 )
@@ -193,6 +200,16 @@ class MakeMultipartModelStar(Protocol):
         multipart_model: MultipartModel,
         **overrides: Any,
     ) -> MultipartModelStar: ...
+
+
+class MakeMetadata(Protocol):
+    def __call__(
+        self,
+        file: File,
+        *,
+        volume: VolumeMeasurement | None = None,
+        **overrides: Any,
+    ) -> Metadata: ...
 
 
 class MakeFile(Protocol):
@@ -377,6 +394,12 @@ class MakeDerivative(Protocol):
     ) -> ArtifactDerivative: ...
 
 
+class MakeMeshContinuation(Protocol):
+    def __call__(
+        self, file: File, *, job: Job | None = None, **overrides: Any
+    ) -> MeshFingerprintContinuation: ...
+
+
 class MakeWorkFence(Protocol):
     def __call__(
         self,
@@ -398,6 +421,17 @@ class MakeWorkExecutor(Protocol):
     ) -> WorkExecutor: ...
 
 
+class MakeWorkEvent(Protocol):
+    def __call__(
+        self,
+        *,
+        scope: WorkEventScope = WorkEventScope.POLICY,
+        scope_key: int | None = None,
+        old: bool = False,
+        **overrides: Any,
+    ) -> WorkEvent: ...
+
+
 class MakeDocument(Protocol):
     def __call__(
         self,
@@ -407,6 +441,17 @@ class MakeDocument(Protocol):
         trashed: bool = False,
         **overrides: Any,
     ) -> Document: ...
+
+
+class MakeStoragePublicationLocator(Protocol):
+    def __call__(
+        self,
+        *,
+        backend: str = "local",
+        namespace: str = "local/test",
+        key: str | None = None,
+        **overrides: Any,
+    ) -> StoragePublicationLocator: ...
 
 
 class MakeOwnedStorageObject(Protocol):
@@ -465,11 +510,13 @@ __all__ = [
     "MakeDocument",
     "MakeExternalLibrary",
     "MakeFile",
+    "MakeMetadata",
     "MakeInboxItem",
     "MakeModel",
     "MakeMultipartModel",
     "MakeMultipartModelStar",
     "MakeOwnedStorageObject",
+    "MakeStoragePublicationLocator",
     "MakePrintJob",
     "MakePrinter",
     "MakePrinterFile",
@@ -482,6 +529,7 @@ __all__ = [
     "MakeDerivativeGroupRegeneration",
     "MakeWorkFence",
     "MakeWorkExecutor",
+    "MakeWorkEvent",
     "TagCollection",
     "TagFile",
     "UserHeaders",
@@ -687,3 +735,14 @@ class MakeSearchProjectionRequest(Protocol):
     def __call__(
         self, source: ContentSource, **overrides: Any
     ) -> SearchProjectionRequest: ...
+
+
+class MakeIngestionScratchWindow(Protocol):
+    def __call__(
+        self,
+        *,
+        directory: Path | None = None,
+        job: Job | None = None,
+        execution_epoch: str | None = None,
+        **overrides: Any,
+    ) -> IngestionScratchWindow: ...

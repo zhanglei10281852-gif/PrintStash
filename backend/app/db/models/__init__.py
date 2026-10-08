@@ -84,12 +84,14 @@ from .ingestion import (
 from .ingestion import (
     InboxItemResult as InboxItemResult,
 )
+from .ingestion import IngestionEntry as IngestionEntry
 from .ingestion import (
     IngestRequest as IngestRequest,
 )
 from .ingestion import (
     StagingLease as StagingLease,
 )
+from .ingestion_scratch import IngestionScratchWindow as IngestionScratchWindow
 from .library import (
     ArtifactMaterialRequirement as ArtifactMaterialRequirement,
 )
@@ -156,6 +158,7 @@ from .media import (
 from .media import (
     DerivativeRegeneration as DerivativeRegeneration,
 )
+from .media import MeshFingerprintContinuation as MeshFingerprintContinuation
 from .notifications import (
     NotificationChannel as NotificationChannel,
 )
@@ -270,6 +273,7 @@ from .storage import (
 from .storage import (
     StorageFailureDomainDeclaration as StorageFailureDomainDeclaration,
 )
+from .storage import StoragePublicationLocator as StoragePublicationLocator
 from .types import (
     SENTINEL_FILE_HASH as SENTINEL_FILE_HASH,
 )
@@ -331,6 +335,7 @@ from .types import (
 from .types import (
     InboxSourceKind as InboxSourceKind,
 )
+from .types import IngestionEntryState as IngestionEntryState
 from .types import (
     IngestRequestKind as IngestRequestKind,
 )
@@ -401,6 +406,9 @@ from .types import (
     VaultAuditSeverity as VaultAuditSeverity,
 )
 from .types import (
+    WorkEventScope as WorkEventScope,
+)
+from .types import (
     WorkPriority as WorkPriority,
 )
 from .vault_migration import VaultGeneration as VaultGeneration
@@ -409,6 +417,7 @@ from .vault_migration import VaultMigrationRun as VaultMigrationRun
 from .work import ACTIVE_JOB_STATES as ACTIVE_JOB_STATES
 from .work import Job as Job
 from .work import ReconcileCursor as ReconcileCursor
+from .work import WorkEvent as WorkEvent
 from .work import WorkExecutor as WorkExecutor
 from .work import WorkFence as WorkFence
 from .work import WorkLaneOverride as WorkLaneOverride

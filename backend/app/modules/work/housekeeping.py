@@ -23,6 +23,9 @@ def _run(ctx: JobContext) -> None:
 
     now = utcnow()
     pruned = jobs.prune(now=now)
+    from . import event_log
+
+    events_pruned = event_log.prune(now=now)
     history = catalog_module.get_engine().prune_history(
         older_than=now - timedelta(days=settings.engine_history_retention_days)
     )
@@ -35,6 +38,7 @@ def _run(ctx: JobContext) -> None:
     ctx.update(
         result={
             "jobs_pruned": pruned,
+            "work_events_pruned": events_pruned,
             "engine_history_pruned": history,
             "executors_forgotten": forgotten,
         }

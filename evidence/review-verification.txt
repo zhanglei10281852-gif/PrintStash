@@ -1,0 +1,6 @@
+复盘验证记录
+1. SQLite 读取：rounds=652；Harness=Trae；effectiveRoundsEvidence.source=count-trae-cn-steps.py；scope=latest_turn；effectiveRounds=652；syncRevision=6。
+2. 代码工作树 HEAD=b6dfda1a42792bc040c84c17ba861bbbba334d99；模型改动集中在 WorkEvent durable log、Job/Derivative writers、WebSocket replay、PostgreSQL reconnect、前端 cursor merge 和测试。
+3. 原始 Trae 轨迹 session-34df2fa1709a6792.md 记录后端 1371 项触达测试、Postgres/NOTIFY 21 项、split topology 4 项 e2e、前端 2827 项 vitest 通过；环境基线失败被单独记录。
+4. 当前 Windows 直接 pytest 复跑被 project-03 缺少 printstash_core 导入阻断；该阻断来自当前 Windows 依赖环境。
+5. 代码审计复现确定缺口：events_ws 初始管理员连接把 work:admin 加入 channels；_replay_response 仅计算 model_channels 的 revoked，降权后仍保留 work:admin bus subscription，live relay 不再经过权限检查。

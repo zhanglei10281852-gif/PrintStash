@@ -16,10 +16,12 @@ rather than handed out as a URL, and its ETag changes when the image does.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import uuid
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -33,9 +35,16 @@ from app.db.models import (
     ModelProvenanceField,
     ModelProvenanceSource,
     ModelSourceCover,
+    OwnedStorageObject,
     ProvenanceCapture,
+    StorageDeleteIntent,
+    StorageObjectState,
 )
+from app.db.session import get_session_factory, override_session_factory
+from app.modules.media.source_cover_processing import process_source_cover_upload
+from app.modules.storage.storage_backend.runtime import get_backend
 from tests.factories import build_collection, build_model, grant_collection_role
+from tests.fakes.thread_sessions import ThreadBoundSessionFactory
 
 SECRET_IN_SNAPSHOT = "must-not-be-returned"
 
@@ -489,7 +498,7 @@ class TestPutModelSourceCover:
         assert response.status_code == 422, response.text
         assert response.json()["detail"] == "source_cover_invalid"
 
-    def test_puts_the_bytes_back_when_the_commit_fails(
+    def test_retires_the_private_candidate_when_the_commit_fails(
         self,
         client: TestClient,
         db_session: Session,
@@ -499,23 +508,19 @@ class TestPutModelSourceCover:
     ) -> None:
         from app.api.v1 import models as models_api
 
-        undone: list[object] = []
-        monkeypatch.setattr(
-            models_api.source_covers,
-            "rollback_after_commit_failure",
-            lambda _session, _backend, result: undone.append(result),
-        )
-        real_put = models_api.source_covers.put
+        real_prepare = models_api.source_covers.prepare_candidate
 
-        def put_then_break(session, backend, **kwargs):
-            result = real_put(session, backend, **kwargs)
-            monkeypatch.setattr(type(session), "commit", _explode, raising=False)
+        def prepare_then_break(session, backend, **kwargs):
+            result = real_prepare(session, backend, **kwargs)
+            monkeypatch.setattr(session, "commit", _explode)
             return result
 
-        def _explode(_self) -> None:
+        def _explode() -> None:
             raise RuntimeError("commit failed")
 
-        monkeypatch.setattr(models_api.source_covers, "put", put_then_break)
+        monkeypatch.setattr(
+            models_api.source_covers, "prepare_candidate", prepare_then_break
+        )
         db_session.rollback()
 
         with pytest.raises(RuntimeError, match="commit failed"):
@@ -525,8 +530,60 @@ class TestPutModelSourceCover:
                 files={"file": ("cover.png", _png(), "image/png")},
             )
 
-        # Written bytes with no row pointing at them are bytes nothing will delete.
-        assert len(undone) == 1
+        db_session.expire_all()
+        assert db_session.exec(select(ModelSourceCover)).all() == []
+        proof = db_session.exec(select(OwnedStorageObject)).one()
+        intent = db_session.exec(select(StorageDeleteIntent)).one()
+        assert proof.state is StorageObjectState.RETIRING
+        assert intent.key == proof.key
+        assert intent.token == proof.token
+        assert intent.status == "pending"
+
+    def test_preserves_the_committed_cover_when_the_commit_acknowledgement_is_lost(
+        self,
+        client: TestClient,
+        db_session: Session,
+        cover_url: str,
+        auth_headers,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from app.api.v1 import models as models_api
+
+        real_prepare = models_api.source_covers.prepare_candidate
+
+        def prepare_then_lose_ack(session, backend, **kwargs):
+            candidate = real_prepare(session, backend, **kwargs)
+            commit = session.commit
+
+            def commit_then_raise():
+                commit()
+                raise RuntimeError("commit acknowledgement lost")
+
+            monkeypatch.setattr(session, "commit", commit_then_raise)
+            return candidate
+
+        monkeypatch.setattr(
+            models_api.source_covers, "prepare_candidate", prepare_then_lose_ack
+        )
+        db_session.rollback()
+
+        with pytest.raises(RuntimeError, match="commit acknowledgement lost"):
+            client.put(
+                cover_url,
+                headers=auth_headers,
+                files={"file": ("cover.png", _png(), "image/png")},
+            )
+
+        db_session.expire_all()
+        cover = db_session.exec(select(ModelSourceCover)).one()
+        proof = db_session.exec(select(OwnedStorageObject)).one()
+        assert cover.storage_key == proof.key
+        assert proof.state is StorageObjectState.COMMITTED
+        assert (
+            get_backend().read_bytes(cover.storage_key)
+            == process_source_cover_upload(_png(), "image/png").data
+        )
+        assert db_session.exec(select(StorageDeleteIntent)).all() == []
 
     def test_reports_a_source_that_does_not_belong_to_this_model(
         self, client: TestClient, db_session: Session, model: Model, auth_headers
@@ -697,3 +754,67 @@ class TestDeleteModelSourceCover:
         self, client: TestClient, uploaded_cover: str
     ) -> None:
         assert client.delete(uploaded_cover).status_code == 401
+
+
+class TestCoverCommandOwnership:
+    def test_upload_uses_thread_owned_sessions(
+        self,
+        client: TestClient,
+        auth_headers,
+        cover_url: str,
+        db_session: Session,
+    ) -> None:
+        factory = ThreadBoundSessionFactory(db_session.get_bind())
+        previous = get_session_factory()
+        override_session_factory(factory)
+        try:
+            response = client.put(
+                cover_url,
+                headers=auth_headers,
+                files={"file": ("owned.png", _png(), "image/png")},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["content_type"] == "image/webp"
+            assert factory.opened_count >= 2
+            assert factory.active_count == 0
+        finally:
+            override_session_factory(previous)
+
+    @pytest.mark.asyncio
+    async def test_keeps_health_responsive_during_publication(
+        self,
+        app,
+        auth_headers,
+        cover_url,
+        monkeypatch,
+    ):
+        from app.api.v1 import models as model_api
+
+        loop = asyncio.get_running_loop()
+        observations = []
+        publish = model_api.source_covers.prepare_candidate
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+
+            def delayed_publication(*args, **kwargs):
+                health = asyncio.run_coroutine_threadsafe(
+                    client.get("/api/v1/health"), loop
+                )
+                try:
+                    observations.append(health.result(timeout=2).status_code)
+                except TimeoutError:
+                    health.cancel()
+                    observations.append(None)
+                return publish(*args, **kwargs)
+
+            monkeypatch.setattr(
+                model_api.source_covers, "prepare_candidate", delayed_publication
+            )
+            response = await client.put(
+                cover_url,
+                headers=auth_headers,
+                files={"file": ("owned.png", _png(), "image/png")},
+            )
+        assert response.status_code == 200, response.text
+        assert observations == [200]

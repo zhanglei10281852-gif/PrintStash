@@ -15,7 +15,7 @@ from sqlmodel import Session
 from app.core.config import settings
 from app.core.metrics import lane_depth
 from app.core.time import utcnow
-from app.db.models import Job, JobKind, JobState, LaneName, WorkExecutor
+from app.db.models import Job, JobKind, JobState, LaneName, WorkEvent, WorkExecutor
 from app.modules.work import housekeeping
 
 
@@ -50,6 +50,22 @@ class TestHousekeeping:
 
         assert _result(db_session, job.id)["jobs_pruned"] == 1
         assert db_session.get(Job, old_id) is None
+
+    def test_prunes_work_events_past_replay_retention(
+        self, work_engine, make_work_event, make_job, db_session: Session
+    ) -> None:
+        from app.modules.work.submission import submit
+
+        expired_seq = make_work_event(old=True).seq
+        recent_seq = make_work_event().seq
+        job = make_job(kind=JobKind.WORK_HOUSEKEEPING, subject="work.housekeeping@now")
+
+        submit(job.id)
+        work_engine.run_one()
+
+        assert _result(db_session, job.id)["work_events_pruned"] == 1
+        assert db_session.get(WorkEvent, expired_seq) is None
+        assert db_session.get(WorkEvent, recent_seq) is not None
 
     def test_forgets_long_dead_executors(
         self, work_engine, make_job, make_work_executor, db_session: Session

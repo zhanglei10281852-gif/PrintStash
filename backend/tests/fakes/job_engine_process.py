@@ -30,18 +30,27 @@ and prints one JSON line the parent reads:
     vault up, open the events socket, upload a mesh and print
     ``{"job_id": ...}``; then wait for the workers the parent starts to finish
     it, and print the notices the socket received and the derivative states.
+``replay``
+    Unified SQLite process: open the panel, close it while a mesh upload runs
+    to completion, then reopen with the first socket's cursor and print the
+    replayed Job states and the second cursor's empty overlap, proving a
+    reopened panel recovers ordered, deduped state without polling.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+from app.modules.work.contracts import JobExecution
 
 _DEADLINE_S = float(os.environ.get("JOB_ENGINE_DEADLINE_S", "120"))
 _STL = (
@@ -92,7 +101,7 @@ def stall(marker: Path) -> None:
     from app.main import app
     from app.modules.derivatives import producers
 
-    def held(file_id: int):
+    def held(file_id: int, *, execution: JobExecution | None = None):
         _publish_marker(marker, file_id)
         while True:  # the parent kills this process here
             time.sleep(1)
@@ -126,6 +135,32 @@ def _follow(client: TestClient, job_id: str) -> dict:
         time.sleep(0.25)
 
 
+def _read_until(ws, frame_type: str) -> dict:
+    deadline = time.monotonic() + _DEADLINE_S
+    while True:
+        frame = ws.receive_json()
+        if frame.get("type") == frame_type:
+            return frame
+        assert time.monotonic() < deadline, f"never received {frame_type}: {frame}"
+        time.sleep(0.05)
+
+
+@contextlib.contextmanager
+def _open_events(client: TestClient, *, cursor: int | None) -> Iterator[tuple]:
+    """Fresh ticket per connection; replay starts after the control frames.
+
+    The session is entered (``with``) before any frame is read: this Starlette
+    opens the cross-thread portal only on entry, so reading before it raises.
+    """
+    ticket = client.post("/api/v1/events/ticket").json()["ticket"]
+    with client.websocket_connect(f"/api/v1/events/ws?ticket={ticket}") as ws:
+        hello = _read_until(ws, "hello")
+        _read_until(ws, "resync")
+        if cursor is not None:
+            ws.send_json({"replay_after": cursor})
+        yield ws, hello
+
+
 def stall_backup(marker: Path) -> None:
     """Back the vault up while its only Artifact's derivative is mid-step.
 
@@ -136,7 +171,7 @@ def stall_backup(marker: Path) -> None:
     from app.main import app
     from app.modules.derivatives import producers
 
-    def held(file_id: int):
+    def held(file_id: int, *, execution: JobExecution | None = None):
         _publish_marker(marker, file_id)
         while True:  # the parent kills this process here
             time.sleep(1)
@@ -227,17 +262,21 @@ def _settle(file_id: int) -> dict:
     deadline = time.monotonic() + _DEADLINE_S
     while True:
         with get_session_factory().scoped_session() as session:
-            file = session.get(File, file_id)
-            assert file is not None
+            # READY and the thumbnail pointer commit together. Read them in
+            # one statement: a writer can commit between two SELECTs, leaving
+            # an earlier ORM File instance beside newer derivative rows.
+            observed = session.exec(
+                select(File, ArtifactDerivative)
+                .outerjoin(ArtifactDerivative, ArtifactDerivative.file_id == File.id)
+                .where(File.id == file_id)
+            ).all()
+            assert observed, f"Artifact {file_id} disappeared while settling"
+            file = observed[0][0]
             current = kinds.recipes_for(file)
             rows = [
                 row
-                for row in session.exec(
-                    select(ArtifactDerivative).where(
-                        ArtifactDerivative.file_id == file_id
-                    )
-                ).all()
-                if current.get(row.kind) == row.recipe_version
+                for _, row in observed
+                if row is not None and current.get(row.kind) == row.recipe_version
             ]
             states = {row.kind: DerivativeState(row.state).value for row in rows}
             outcome = {
@@ -267,7 +306,11 @@ def _diagnostics() -> dict:
 
     with get_session_factory().scoped_session() as session:
         jobs = session.exec(select(Job)).all()
-        ids = [execution_id(job.id, job.attempts) for job in jobs if job.attempts]
+        ids = [
+            execution_id(job.id, job.attempts, job.execution_epoch)
+            for job in jobs
+            if job.attempts
+        ]
         evidence = get_engine().evidence(ids) if ids else {}
         return {
             "jobs": [
@@ -342,11 +385,11 @@ def rederive(file_id: int) -> None:
     shown_while_deriving: list[str | None] = []
     original = producers.derive_mesh
 
-    def observed(derived_id: int):
+    def observed(derived_id: int, *, execution: JobExecution | None = None):
         with get_session_factory().scoped_session() as session:
             file = session.get(File, derived_id)
             shown_while_deriving.append(file.thumbnail_path if file else None)
-        return original(derived_id)
+        return original(derived_id, execution=execution)
 
     # Before the lifespan builds the catalog, which captures the producer.
     producers.derive_mesh = observed
@@ -378,6 +421,7 @@ def split_api() -> None:
         _set_up(client)
         ticket = client.post("/api/v1/events/ticket").json()["ticket"]
         with client.websocket_connect(f"/api/v1/events/ws?ticket={ticket}") as ws:
+            assert ws.receive_json()["type"] == "hello"
             assert ws.receive_json() == {"type": "resync"}
             uploaded = client.post(
                 "/api/v1/ingest/model",
@@ -397,6 +441,29 @@ def split_api() -> None:
                     "failed",
                 }:
                     break
+
+        # The panel reopens after the work is done: a fresh socket replays the
+        # worker's committed changes from the shared database, not from memory.
+        with _open_events(client, cursor=0) as (reopened, _):
+            frame = _read_until(reopened, "replay")
+            replayed = [
+                event
+                for event in frame["events"]
+                if event.get("job_id") == job_id and event.get("type") == "job"
+            ]
+            assert replayed[-1]["state"] == "completed", frame
+            assert [event["seq"] for event in replayed] == sorted(
+                {event["seq"] for event in replayed}
+            )
+            # Live NOTIFY is best effort; the durable replay is the superset.
+            # Everything live delivered for this Job must be recoverable from
+            # the log, and the log may additionally fill dropped notices.
+            live_seqs = {
+                notice["seq"]
+                for notice in notices
+                if notice.get("job_id") == job_id and "seq" in notice
+            }
+            assert live_seqs <= {event["seq"] for event in replayed}
         file_id = client.get(f"/api/v1/jobs/{job_id}").json()["file_id"]
         deadline = time.monotonic() + _DEADLINE_S
         while True:
@@ -418,6 +485,55 @@ def split_api() -> None:
         _emit(
             notices=[n for n in notices if n.get("job_id") == job_id],
             states=states,
+            replayed=[event["state"] for event in replayed],
+        )
+
+
+def replay() -> None:
+    """Reopen the panel after the Job completed and recover it from the log."""
+    from app.core.config import ensure_dirs
+    from app.main import app
+
+    ensure_dirs()
+    with TestClient(app) as client:
+        _set_up(client)
+        ticket = client.post("/api/v1/events/ticket").json()["ticket"]
+        with client.websocket_connect(f"/api/v1/events/ws?ticket={ticket}") as first:
+            hello = _read_until(first, "hello")
+            _read_until(first, "resync")
+            uploaded = client.post(
+                "/api/v1/ingest/model",
+                files={"file": ("replay.stl", _STL, "application/sla")},
+            )
+            assert uploaded.status_code == 202, uploaded.text
+            job_id = uploaded.json()["job_id"]
+            _follow(client, job_id)
+
+        with _open_events(client, cursor=hello["head"]) as (second, _):
+            frame = _read_until(second, "replay")
+            notices = [
+                event
+                for event in frame["events"]
+                if event.get("job_id") == job_id and event.get("type") == "job"
+            ]
+            states = [notice["state"] for notice in notices]
+            seqs = [notice["seq"] for notice in notices]
+            assert states[-1] == "completed", states
+            assert seqs == sorted(set(seqs)), seqs
+
+            second.send_json({"replay_after": frame["next_cursor"]})
+            again = _read_until(second, "replay")
+            overlap = [
+                event
+                for event in again["events"]
+                if event.get("job_id") == job_id
+            ]
+            assert overlap == []
+        _emit(
+            job_id=job_id,
+            states=states,
+            replayed=[n["state"] for n in notices],
+            overlap=overlap,
         )
 
 
@@ -440,6 +556,8 @@ if __name__ == "__main__":
         restore_converge(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     elif role == "rederive":
         rederive(int(sys.argv[2]))
+    elif role == "replay":
+        replay()
     elif role == "split_api":
         split_api()
     else:

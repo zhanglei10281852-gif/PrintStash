@@ -37,10 +37,16 @@ from app.db.models import (
     JobState,
     StagingLease,
     User,
+    WorkEventScope,
 )
+from app.db.session import get_session_factory
 from app.modules.identity import ws_tickets
 from app.modules.identity.auth import create_access_token
+from app.modules.work import event_log
+from app.modules.work import events as work_events
 from app.modules.work.catalog import get_engine
+from app.modules.work.contracts import JobOutcome
+from app.modules.work.jobs import jobs as job_store
 from app.runtime.realtime import InProcessBus
 from tests.factories import build_collection, build_user, grant_collection_role
 
@@ -343,7 +349,7 @@ class TestCancelJob:
         )
 
         assert response.status_code == 200, response.text
-        assert cancelled == [f"{request.job_id}:2"]
+        assert cancelled == [f"{request.job_id}:{job.execution_epoch}:2"]
 
     def test_an_engine_that_cannot_cancel_does_not_fail_the_request(
         self,
@@ -548,13 +554,21 @@ def _wait_subscribed(bus, channel: str) -> None:
         time.sleep(0.01)
 
 
+def _prime(ws) -> dict:
+    """Drain the frames every new stream starts with; return the hello."""
+    hello = ws.receive_json()
+    assert hello["type"] == "hello", hello
+    assert ws.receive_json() == {"type": "resync"}
+    return hello
+
+
 class TestEventsSocket:
     def test_authenticated_members_receive_policy_notices(self, client, app, owner):
         bus = app.state.event_bus
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
         ) as ws:
-            assert ws.receive_json() == {"type": "resync"}
+            _prime(ws)
             notice = {"type": "derivative_policy"}
             ws.portal.call(bus.publish, "derivatives:policy", notice)
             assert ws.receive_json() == notice
@@ -568,7 +582,9 @@ class TestEventsSocket:
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={response.json()['ticket']}"
         ) as ws:
-            assert ws.receive_json() == {"type": "resync"}
+            hello = _prime(ws)
+
+        assert {"head", "floor", "retention_seconds"} <= set(hello)
 
     def test_delivers_notices_about_the_users_own_jobs(
         self, client: TestClient, app, owner: User
@@ -577,7 +593,7 @@ class TestEventsSocket:
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
         ) as ws:
-            ws.receive_json()
+            _prime(ws)
             notice = {"type": "job", "job_id": "j1", "state": "running"}
             ws.portal.call(bus.publish, f"jobs:{owner.id}", notice)
 
@@ -593,7 +609,7 @@ class TestEventsSocket:
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
         ) as ws:
-            ws.receive_json()
+            _prime(ws)
             ws.send_json({"subscribe": f"model:{model.id}"})
             # The acknowledgement tells the client to refetch what changed
             # before the subscription took effect.
@@ -624,7 +640,7 @@ class TestEventsSocket:
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
         ) as ws:
-            ws.receive_json()
+            _prime(ws)
             ws.send_json({"subscribe": f"model:{hidden.id}"})
             ws.send_json({"subscribe": f"model:{visible.id}"})
 
@@ -642,7 +658,7 @@ class TestEventsSocket:
         with client.websocket_connect(
             f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
         ) as ws:
-            ws.receive_json()
+            _prime(ws)
 
         deadline = time.monotonic() + 5
         while bus._subscribers.get(f"jobs:{owner.id}"):
@@ -667,7 +683,9 @@ class TestEventsSocket:
                 nonlocal sends
                 if message["type"] == "websocket.send":
                     sends += 1
-                    if sends > 1:
+                    # The two control frames (hello, resync) land; only the
+                    # later notice hits the reset connection, exactly once.
+                    if sends == 3:
                         raise OSError("connection reset")
 
             scope = {
@@ -758,7 +776,7 @@ class TestEventsSocket:
             with client.websocket_connect(
                 f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
             ) as ws:
-                ws.receive_json()
+                _prime(ws)
                 for model_id in range(jobs_routes._MAX_SUBSCRIPTION_REQUESTS + 5):
                     ws.send_json({"subscribe": f"model:{model_id}"})
                 ws.receive_json()
@@ -774,6 +792,273 @@ class TestEventsSocket:
         )
 
         assert response.status_code == 401, response.text
+
+
+class TestEventReplay:
+    def _finish_job(self, owner: User, subject: str) -> str:
+        job_id = job_store.create(
+            definition=JobKind.INGESTION_UPLOAD,
+            subject_key=subject,
+            owner_user_id=owner.id,
+        )
+        job_store.finish(job_id, JobOutcome.COMPLETED)
+        return job_id
+
+    def test_replays_committed_changes_after_the_cursor(
+        self, client: TestClient, owner: User
+    ) -> None:
+        before = 0
+        job_id = self._finish_job(owner, f"replay/ws/{owner.id}/1")
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            hello = _prime(ws)
+            assert hello["head"] >= before
+            ws.send_json({"replay_after": 0})
+
+            frame = ws.receive_json()
+            assert frame["type"] == "replay", frame
+            assert frame["has_more"] is False
+            notices = [event for event in frame["events"] if event["type"] == "job"]
+            assert [event["job_id"] for event in notices] == [job_id, job_id]
+            assert [event["state"] for event in notices][-1] == "completed"
+            seqs = [event["seq"] for event in frame["events"]]
+            assert seqs == sorted(seqs)
+            assert all(seq > 0 for seq in seqs)
+            # The newest global row is the admin copy the owner scope does not
+            # contain; the cursor lands on the last visible row, after which
+            # the owner reads nothing new.
+            assert frame["next_cursor"] == seqs[-1]
+            ws.send_json({"replay_after": frame["next_cursor"]})
+            tail = ws.receive_json()
+            assert tail["type"] == "replay", tail
+            assert tail["events"] == []
+            assert tail["next_cursor"] == frame["next_cursor"]
+
+    def test_live_and_replayed_notices_share_one_seq(
+        self, client: TestClient, app, owner: User
+    ) -> None:
+        # The integration harness does not run the lifespan: start the bus and
+        # bind the publisher exactly like production does, so the worker
+        # thread's committed notice reaches this socket live.
+        bus = app.state.event_bus
+
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            ws.portal.call(bus.start)
+            work_events.bind(bus)
+            try:
+                job_id = self._finish_job(owner, f"replay/ws/{owner.id}/2")
+                live = ws.receive_json()
+                while live.get("job_id") != job_id or live.get("state") != "completed":
+                    live = ws.receive_json()
+
+                ws.send_json({"replay_after": live["seq"] - 1})
+                frame = ws.receive_json()
+
+                assert frame["type"] == "replay", frame
+                replayed = [
+                    event
+                    for event in frame["events"]
+                    if event.get("job_id") == job_id
+                    and event.get("state") == "completed"
+                ]
+                assert [event["seq"] for event in replayed] == [live["seq"]]
+            finally:
+                work_events.bind(None)
+                ws.portal.call(bus.stop)
+
+    def test_an_expired_cursor_returns_a_resync_with_the_head(
+        self, client: TestClient, owner: User, make_work_event
+    ) -> None:
+        # Seed and prune from separate sessions: the replay handler reads from
+        # a worker thread, and the test session would hold a snapshot on the
+        # shared in-memory connection.
+        old = make_work_event(
+            scope=WorkEventScope.JOB_OWNER,
+            scope_key=owner.id,
+            payload_json='{"type":"job"}',
+            old=True,
+        )
+        old_seq = old.seq
+        with get_session_factory().scoped_session() as seed:
+            event_log.record_policy(seed)
+            seed.commit()
+        event_log.prune()
+        with get_session_factory().scoped_session() as check:
+            recent_floor = event_log.floor_seq(check)
+
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            ws.send_json({"replay_after": old_seq})
+
+            frame = ws.receive_json()
+            assert frame["type"] == "resync", frame
+            assert frame["reason"] == "cursor_expired"
+            assert frame["head"] >= recent_floor > old_seq
+
+    def test_a_cursor_ahead_of_the_log_returns_a_resync(
+        self, client: TestClient, owner: User
+    ) -> None:
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            hello = _prime(ws)
+            ws.send_json({"replay_after": hello["head"] + 1_000_000})
+
+            frame = ws.receive_json()
+            assert frame == {
+                "type": "resync",
+                "reason": "cursor_ahead",
+                "head": hello["head"],
+            }
+
+    def test_a_revoked_model_scope_resyncs_and_leaves_the_channel(
+        self,
+        client: TestClient,
+        app,
+        db_session: Session,
+        owner: User,
+        make_model,
+    ) -> None:
+        shelf = build_collection(db_session, "Revoked shelf")
+        grant_collection_role(db_session, owner, shelf)
+        model = make_model(collection=shelf)
+        bus = app.state.event_bus
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            ws.send_json({"subscribe": f"model:{model.id}"})
+            assert ws.receive_json()["type"] == "subscribed"
+            _wait_subscribed(bus, f"model:{model.id}")
+
+            model.deleted_at = utcnow()
+            db_session.add(model)
+            db_session.commit()
+            # Let the replay handler read from a fresh transaction, not this
+            # thread's snapshot on the shared connection.
+            db_session.rollback()
+
+            ws.send_json({"replay_after": 0})
+
+            frame = ws.receive_json()
+            assert frame["type"] == "resync", frame
+            assert frame["reason"] == "scope_revoked"
+            deadline = time.monotonic() + 5
+            while bus._subscribers.get(f"model:{model.id}"):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+
+    def test_a_replay_after_the_user_is_deactivated_closes(
+        self, client: TestClient, owner: User
+    ) -> None:
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            with get_session_factory().scoped_session() as session:
+                fresh = session.get(User, owner.id)
+                assert fresh is not None
+                fresh.is_active = False
+                session.add(fresh)
+                session.commit()
+
+            ws.send_json({"replay_after": 0})
+
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_json()
+            assert closed.value.code == 1008
+
+    def test_a_demoted_administrator_replays_without_admin_rows(
+        self, client: TestClient, admin: User, make_user
+    ) -> None:
+        other = make_user()
+        other_job = self._finish_job(other, f"replay/ws/{other.id}/demoted")
+        own_job = self._finish_job(admin, f"replay/ws/{admin.id}/demoted")
+        with get_session_factory().scoped_session() as session:
+            fresh = session.get(User, admin.id)
+            assert fresh is not None
+            fresh.is_superuser = False
+            session.add(fresh)
+            session.commit()
+
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, admin)}"
+        ) as ws:
+            _prime(ws)
+            ws.send_json({"replay_after": 0})
+
+            frame = ws.receive_json()
+            assert frame["type"] == "replay", frame
+            job_ids = {
+                event["job_id"]
+                for event in frame["events"]
+                if event.get("type") == "job"
+            }
+            assert own_job in job_ids
+            assert other_job not in job_ids
+
+    def test_pages_replay_to_the_new_cursor(
+        self, client, monkeypatch, owner: User, make_work_event
+    ) -> None:
+        for _ in range(3):
+            make_work_event(
+                scope=WorkEventScope.JOB_OWNER,
+                scope_key=owner.id,
+                payload_json='{"type":"job"}',
+            )
+        monkeypatch.setattr(event_log, "REPLAY_LIMIT", 2)
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            ws.send_json({"replay_after": 0})
+            first = ws.receive_json()
+            assert first["type"] == "replay", first
+            assert len(first["events"]) == 2
+            assert first["has_more"] is True
+
+            ws.send_json({"replay_after": first["next_cursor"]})
+            second = ws.receive_json()
+            assert second["type"] == "replay", second
+            assert len(second["events"]) == 1
+            assert second["has_more"] is False
+            assert second["next_cursor"] > first["next_cursor"]
+
+    def test_replay_requests_beyond_the_cap_close_the_socket(
+        self, client: TestClient, owner: User
+    ) -> None:
+        from app.api.v1 import jobs as jobs_routes
+
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect(
+                f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+            ) as ws:
+                _prime(ws)
+                for _ in range(jobs_routes._MAX_REPLAY_REQUESTS + 1):
+                    ws.send_json({"replay_after": 1_000_000})
+                    ws.receive_json()
+
+        assert closed.value.code == 1008
+
+    def test_a_malformed_cursor_is_ignored(self, client, app, owner: User) -> None:
+        bus = app.state.event_bus
+        with client.websocket_connect(
+            f"/api/v1/events/ws?ticket={_ticket(client, owner)}"
+        ) as ws:
+            _prime(ws)
+            ws.send_json({"replay_after": "5"})
+            ws.send_json({"replay_after": -1})
+            ws.send_json({"replay_after": True})
+            notice = {"type": "derivative_policy"}
+            ws.portal.call(bus.publish, "derivatives:policy", notice)
+
+            assert ws.receive_json() == notice
 
 
 class TestChannelAuthorization:

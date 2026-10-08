@@ -1,5 +1,63 @@
 # PrintStash Upgrade Guide
 
+## Unreleased: bounded import windows
+
+Batch imports materialize one disposable entry at a time. The positive settings
+`VAULT_INGESTION_BATCH_MAX_FILES=4` and `VAULT_INGESTION_BATCH_MAX_MB=512` set
+per-import upper bounds; the sequential materializer currently uses one file.
+A selected entry larger than the byte bound is refused before extraction.
+Archive containers and durable upload sources have separate existing limits.
+
+The application migration adds an `ingestion_entries` table and indexes on
+SQLite and PostgreSQL. Existing Models, Artifacts and Jobs remain in place;
+SQLite remains the default. No database-engine conversion is required.
+Stop API and workers together before upgrading, then restart on the same image
+so every writer participates in per-entry confirmation. Back up before upgrading
+as usual. Existing reviewed ZIP validation is retained.
+
+## Unreleased: request command capacity
+
+File acceptance now has a separate per-API-process command limit. The default
+`VAULT_API_COMMAND_CONCURRENCY=8` accepts values from 1 through 128; add it to
+your API environment override to tune concurrent SQL and storage commands. It
+does not change background Job lane limits. A streamed request waiting for its
+next body chunk holds neither a command token nor a SQL Session.
+
+Restart the API on the new image. This change adds no database migration or
+derivative recipe; SQLite remains the default and existing data stays in place.
+
+## Unreleased: Python 3.14
+
+Source installations of the application and shared core require Python 3.14 or
+newer. Recreate the backend virtual environment with Python 3.14 and run
+`uv sync --all-groups` before restarting API and worker processes. Development,
+CI and official images use Python 3.14.8; image installations need no host Python
+upgrade. Earlier Python runtimes are no longer supported.
+
+## Unreleased: derivative scheduling
+
+SQLite remains the default; this upgrade does not move data to PostgreSQL.
+The additive application migrations preserve existing Artifacts, scan positions
+and Job execution facts while adding discovery turns, recent cursor fields,
+timestamp indices and a nullable backfill admission epoch. The new reservation
+is separate from accepted execution epochs and does not spend a retry attempt.
+
+Derivation queues now share bounded interactive/backfill allowances and use FIFO
+engine dispatch. Before upgrading, stop new uploads, viewer requests and bulk
+regeneration. Allow the existing API and workers to drain their derivation Jobs,
+then stop every API and worker process and restart them on the new image
+together. The native resource receipt format also changes; no old application
+process may continue admitting native or prepared-source work during restart.
+Existing previews remain usable; no new recipe is introduced by scheduling.
+
+Startup reports `derivation_queue_requires_drain` before enabling consumers if
+legacy derivation ranks remain, inspection fails, or its bounded inspection
+cannot verify the queue. Keep the old image available to finish draining. Do
+not delete application Jobs, managed files or admission receipts to bypass this
+check. As with the DBOS upgrade below, disposable engine state may be rebuilt
+only with all processes stopped; unfinished application Jobs then replay through
+the reconciler, and engine checkpoints are lost.
+
 ## Unreleased: DBOS 3.0
 
 The embedded background engine upgrades from DBOS 2.31.1 to 3.0.0. Its first
@@ -385,3 +443,19 @@ supported rollback path.
 
 For recovery details, see
 [Disaster recovery](./docs/disaster-recovery.md).
+
+### Native memory profiles
+
+Local model residency now shares a separate file-lock ledger across the API and
+worker. The default `VAULT_EMBEDDING_MEMORY_BUDGET_FRACTION=0.25` leaves
+headroom beside geometry's effective 0.5 allocation. The combined fractions must
+be below 1. Unknown physical memory refuses local model admission. Set
+`VAULT_EMBEDDING_RESIDENT_WORKERS` (default 1, maximum 2) and
+`VAULT_EMBEDDING_WORKER_MEMORY_MB` (default 1024, minimum 512) for the models
+you install; a model whose mappings exceed the ceiling fails with a memory error.
+
+Stop all API and worker processes before changing memory partitions or model
+residency settings, then restart all with the same profile and shared local data
+root. Mixed profiles during a rolling restart do not provide a common physical
+memory bound. An idle cached model may retire under residency pressure and
+reload on its next request.

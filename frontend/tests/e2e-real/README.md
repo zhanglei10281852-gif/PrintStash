@@ -94,7 +94,7 @@ vault (search, tag filter, list/grid toggle, empty state, narrow responsive tool
 (create / nest / subtree count / delete / recursive-delete non-empty from the sidebar / lazy child expansion and Model move) ·
 documents (markdown editor, collection README, GFM tables) · tags (quick create/assign from a card,
 global delete) ·
-uploads (mesh-only source, BGCODE metadata, into a collection, ZIP preparation in Tasks → select all or select a folder → selected import) · full backup recovery
+uploads (legacy browser queue recovery and clearing across reloads, mesh-only source, BGCODE metadata, into a collection, ZIP preparation in Tasks → select all or select a folder → selected import) · full backup recovery
 (purge → UI restore → byte-for-byte download) · filament & printer presets
 (create / edit / delete) · model lifecycle (upload → edit → trash → restore →
 purge) · model detail (edit tags with save/cancel, log a manual print, download
@@ -153,3 +153,5 @@ Search clarity: the AI-search flow verifies that Enter preserves the live librar
 AI Search settings: the Settings browser flow waits for loaded AI data, visits guided setup, search types, AI servers and technical options, captures desktop and mobile views, and checks visible choices and horizontal fit.
 
 - ZIP uploads: a failed preparation retains input capacity; Tasks confirms and discards it safely.
+
+`viewer-stl.spec.ts`: an adversarial 3MF displays a persisted memory refusal across browser reloads while its original remains downloadable.

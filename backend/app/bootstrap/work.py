@@ -190,15 +190,12 @@ def start(
     """
     global _runtime
     from app.modules.work import events
-    from app.modules.work.jobs import jobs
 
     validate_topology()
     catalog = catalog or build_catalog()
     engine = engine or build_engine(catalog)
     lanes = listen_lanes()
     events.bind(publisher)
-    jobs.clear_listeners()
-    jobs.subscribe(events.job_changed)
     catalog_module.bind(engine, catalog)
     engine.launch(listen_lanes=lanes)
     executors.register(
@@ -209,7 +206,11 @@ def start(
         retired = executors.retire_predecessors()
         if retired:
             logger.warning("rerunning the work of %d previous API process(es)", retired)
-    from app.modules.work.reconciler import sweep_foreign_versions, sweep_lost_passes
+    from app.modules.work.reconciler import (
+        sweep_foreign_versions,
+        sweep_lost_passes,
+        sweep_lost_terminal_attempts,
+    )
     from app.modules.work.submission import forget_queued_passes, nudge_all
 
     swept = sweep_foreign_versions()
@@ -222,6 +223,9 @@ def start(
     lost = sweep_lost_passes()
     if lost:
         logger.warning("cancelled %d reconcile pass(es) of a lost executor", lost)
+    terminal = sweep_lost_terminal_attempts()
+    if terminal:
+        logger.warning("cancelled %d terminal attempt(s) of a lost executor", terminal)
     # Queued-pass marks may belong to passes a dead process (or the sweep
     # above) will never run; without this the startup reconcile below would
     # be suppressed until their grace expires.
@@ -298,11 +302,9 @@ def stop() -> None:
         runtime.engine.shutdown()
     finally:
         from app.modules.work import events
-        from app.modules.work.jobs import jobs
 
         catalog_module.bind(None, None)
         events.bind(None)
-        jobs.clear_listeners()
         from app.modules.work import async_steps
 
         async_steps.stop()

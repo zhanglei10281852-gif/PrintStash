@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Duplex } from "node:stream";
 import type { SubjectCaption } from "../../src/types/captions";
 import type { SearchStatus } from "../../src/types/search";
+import type { MetadataRead } from "../../src/types/models";
 
 const now = "2026-06-04T00:24:22.000000";
 
@@ -34,7 +35,7 @@ function mockNode(row: ReturnType<typeof mockCollection>) {
   return { ...row, child_count: 0, descendant_count: 0, display_path: row.name };
 }
 
-const metadata = {
+const metadata: MetadataRead = {
   slicer_name: "OrcaSlicer",
   slicer_version: "OrcaSlicer 2.3.1",
   printer_model: "Creality Ender-3 V3 SE",
@@ -58,6 +59,13 @@ const metadata = {
   bbox_y_mm: null,
   bbox_z_mm: null,
   volume_mm3: null,
+  volume_measurement: {
+    state: "legacy_unassessed",
+    unit: "mm3",
+    method: null,
+    value_mm3: null,
+    cause: null,
+  },
   triangle_count: null,
 };
 
@@ -1007,6 +1015,59 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   }
   // The tree a level, a lookup or a search at a time. Every mock collection is
   // a top-level folder with nothing below it.
+  if (url.pathname.startsWith("/api/v1/outliner/")) {
+    const leaves = modelList.map(({ id, name, collection, collection_id }) => ({
+      kind: "model",
+      id,
+      name,
+      collection,
+      collection_id,
+      collection_label: mockCollections().find((row) => row.id === collection_id)?.name ?? null,
+    }));
+    const page = <T extends { name: string; id: number }>(items: T[]) => {
+      const offset = Number(url.searchParams.get("cursor") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const sorted = [...items].sort((a, b) => a.name.localeCompare(b.name) || a.id - b.id);
+      return {
+        items: sorted.slice(offset, offset + limit),
+        next_cursor: sorted.length > offset + limit ? String(offset + limit) : null,
+      };
+    };
+    if (url.pathname.endsWith("/collections")) {
+      const rows = mockCollections().map((row) => ({
+        ...mockNode(row),
+        direct_entry_count: leaves.filter((item) => item.collection_id === row.id).length,
+        subtree_entry_count: leaves.filter((item) => item.collection_id === row.id).length,
+        visible_child_count: 0,
+      }));
+      sendJson(res, {
+        ...page(url.searchParams.has("parent_id") ? [] : rows),
+        parent_direct_entry_count: leaves.filter((item) => item.collection_id === null).length,
+        revealed: rows.find((row) => row.id === Number(url.searchParams.get("reveal_id"))) ?? null,
+      });
+    } else if (url.pathname.endsWith("/entries")) {
+      const id = url.searchParams.get("collection_id");
+      sendJson(
+        res,
+        page(leaves.filter((row) => row.collection_id === (id === null ? null : Number(id)))),
+      );
+    } else {
+      const q = (url.searchParams.get("q") ?? "").toLowerCase();
+      const folders = mockCollections().map((row) => ({
+        kind: "collection",
+        id: row.id,
+        name: row.name,
+        collection: row.path,
+        collection_id: row.id,
+        collection_label: row.name,
+      }));
+      sendJson(
+        res,
+        page([...leaves, ...folders].filter((row) => row.name.toLowerCase().includes(q))),
+      );
+    }
+    return;
+  }
   if (url.pathname === "/api/v1/collections/children") {
     const top = url.searchParams.get("parent_id") === null;
     sendJson(res, { items: top ? mockCollections().map(mockNode) : [], next_cursor: null });
@@ -2062,8 +2123,9 @@ function textFrame(text: string): Buffer {
 
 /**
  * Accept the events socket the way the real server does: complete the
- * handshake and send the `resync` every new connection starts with. Nothing
- * else is sent; the mock backend has no background work to report.
+ * handshake, send `hello` bounds and the initial `resync`, and answer a
+ * `replay_after` cursor with an empty page — the mock backend has no
+ * retained work to report.
  */
 function acceptEventsSocket(req: IncomingMessage, socket: Duplex): void {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -2081,9 +2143,53 @@ function acceptEventsSocket(req: IncomingMessage, socket: Duplex): void {
       "Connection: Upgrade\r\n" +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
+  socket.write(
+    textFrame(JSON.stringify({ type: "hello", head: 0, floor: 0, retention_seconds: 86400 })),
+  );
   socket.write(textFrame(JSON.stringify({ type: "resync" })));
-  // Client frames (subscriptions, the close handshake) need no answer here.
-  socket.on("data", () => {});
+  // Only the client's replay cursor needs an answer; subscriptions mirror
+  // what the real server acks but no mock view waits on them.
+  let buffered = Buffer.alloc(0);
+  socket.on("data", (chunk: Buffer) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length < 2 || (buffered[1] & 0x80) === 0) return;
+    let header = 2;
+    const encoded = buffered[1] & 0x7f;
+    if (encoded === 126) header = 4;
+    else if (encoded === 127) header = 10;
+    const length =
+      encoded === 126
+        ? buffered.readUInt16BE(2)
+        : encoded === 127
+          ? Number(buffered.readBigUInt64BE(2))
+          : encoded;
+    const total = header + 4 + length;
+    if (buffered.length < total) return;
+    const mask = buffered.subarray(header, header + 4);
+    const masked = buffered.subarray(header + 4, total);
+    const payload = Buffer.from(masked.map((byte, index) => byte ^ mask[index % 4]));
+    buffered = buffered.subarray(total);
+    let message: { replay_after?: unknown };
+    try {
+      message = JSON.parse(payload.toString());
+    } catch {
+      return;
+    }
+    const cursor = Number(message.replay_after);
+    if (Number.isInteger(cursor) && cursor >= 0) {
+      socket.write(
+        textFrame(
+          JSON.stringify({
+            type: "replay",
+            events: [],
+            next_cursor: cursor,
+            has_more: false,
+            head: Math.max(0, cursor),
+          }),
+        ),
+      );
+    }
+  });
   socket.on("error", () => socket.destroy());
 }
 

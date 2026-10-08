@@ -9,6 +9,8 @@ schedules) with ``include_system``.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from typing import TypeGuard
 
 from fastapi import (
     APIRouter,
@@ -22,11 +24,13 @@ from fastapi import (
 from sqlmodel import Session
 from starlette.websockets import WebSocketState
 
+from app.core.config import settings
 from app.core.security import require_auth, require_user
 from app.db.models import CollectionRole, JobKind, Model, User
 from app.db.session import get_session_factory
 from app.modules.identity import rbac, ws_tickets
 from app.modules.identity.auth import get_user_by_id
+from app.modules.work import event_log
 from app.modules.work import service as work_service
 from app.modules.work.jobs import jobs
 from app.schemas.jobs import JobStatus
@@ -40,6 +44,9 @@ _MAX_SUBSCRIPTIONS = 64
 # client following Models as a user browses stays far below this; one that
 # exceeds it is probing, and is disconnected.
 _MAX_SUBSCRIPTION_REQUESTS = 256
+# Paging replay plus replaying after a dropped NOTIFY connection is bounded per
+# connection; beyond this a client is looping rather than catching up.
+_MAX_REPLAY_REQUESTS = 16
 
 
 @router.get(
@@ -163,17 +170,93 @@ def _may_subscribe(session: Session, user: User, channel: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _ReplayResponse:
+    frame: dict
+    revoked: tuple[str, ...] = ()
+
+
+def _model_channels(channels: frozenset[str]) -> tuple[str, ...]:
+    return tuple(sorted(c for c in channels if c.startswith("model:")))
+
+
+def _replay_response(
+    user: User, channels: frozenset[str], cursor: int
+) -> _ReplayResponse | None:
+    """The replay frame for ``cursor``, or a bounded resync for a dead cursor.
+
+    Every row is filtered through the scopes this connection holds *now*: a
+    demoted administrator gets no admin rows, and a Model this connection once
+    followed that is trashed or no longer VIEW-able revokes that subscription
+    and forces a resync instead of leaking its later events.
+    """
+    with get_session_factory().scoped_session() as session:
+        fresh = session.get(User, user.id)
+        if fresh is None or not fresh.is_active:
+            return None
+        assert fresh.id is not None
+        model_channels = _model_channels(channels)
+        revoked = tuple(
+            channel
+            for channel in model_channels
+            if not _may_subscribe(session, fresh, channel)
+        )
+        head = event_log.head_seq(session)
+        if revoked:
+            return _ReplayResponse(
+                frame={"type": "resync", "reason": "scope_revoked", "head": head},
+                revoked=revoked,
+            )
+        floor = event_log.floor_seq(session)
+        if cursor > 0 and cursor < floor:
+            return _ReplayResponse(
+                frame={"type": "resync", "reason": "cursor_expired", "head": head}
+            )
+        if cursor > head:
+            # A restored or different database has a younger sequence space.
+            return _ReplayResponse(
+                frame={"type": "resync", "reason": "cursor_ahead", "head": head}
+            )
+        model_ids = tuple(
+            int(channel.partition(":")[2]) for channel in model_channels
+        )
+        page = event_log.replay(
+            session,
+            cursor=cursor,
+            user_id=fresh.id,
+            is_superuser=fresh.is_superuser,
+            model_ids=model_ids,
+        )
+        return _ReplayResponse(
+            frame={
+                "type": "replay",
+                "events": page.events,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+                "head": head,
+            }
+        )
+
+
 @events_router.websocket("/ws")
 async def events_ws(websocket: WebSocket) -> None:
     """Notices about Jobs and derivatives; refetch through the REST endpoints.
 
-    The client is subscribed to its own Jobs (and, for an administrator, to
-    every Job) on connect, and may send ``{"subscribe": "model:<id>"}`` or
-    ``{"unsubscribe": ...}`` for the Models it is viewing; each accepted
-    subscription is acknowledged with ``{"type": "subscribed", "channel": ...}``
-    so the client can refetch what changed before it took effect. Messages are
-    notices (``{"type": "job", "job_id": ...}``); ``{"type": "resync"}`` asks
-    the client to refetch everything it shows.
+    On connect the server sends ``{"type": "hello", "head", "floor",
+    "retention_seconds"}`` — the durable log's current bounds — and then
+    ``{"type": "resync"}`` for clients that fetch everything once (older
+    builds keep treating that as their cue). A client holding a cursor sends
+    ``{"replay_after": <seq>}`` and receives one ordered
+    ``{"type": "replay", "events", "next_cursor", "has_more", "head"}`` page
+    of what it missed across its currently authorized scopes; it merges the
+    page with live frames, deduping by ``seq``, pages while ``has_more``, and
+    refetches on ``{"type": "resync", "reason", "head"}`` when the cursor is
+    expired, ahead of the log, or names a scope that disappeared. Every live
+    notice carries the same ``seq`` it was committed with. The client may also
+    send ``{"subscribe": "model:<id>"}`` / ``{"unsubscribe": ...}``; each
+    accepted subscription is acknowledged with ``{"type": "subscribed",
+    "channel": ...}`` so the client can refetch what changed before it took
+    effect.
     """
     ticket = websocket.query_params.get("ticket")
     user_id = ws_tickets.consume(ticket, ws_tickets.EVENTS_SCOPE) if ticket else None
@@ -194,8 +277,25 @@ async def events_ws(websocket: WebSocket) -> None:
     )
     for channel in channels:
         await bus.subscribe(channel, sink)
-    await sink({"type": "resync"})
+    with get_session_factory().scoped_session() as session:
+        hello = {
+            "type": "hello",
+            "head": event_log.head_seq(session),
+            "floor": event_log.floor_seq(session),
+            "retention_seconds": settings.work_events_retention_hours * 3600,
+        }
+    try:
+        await sink(hello)
+        # Kept after hello: older builds ignore the frame they do not know
+        # and still refetch on this one.
+        await sink({"type": "resync"})
+    except OSError:
+        # The socket died during the handshake; nothing will read a close
+        # frame, and reading it would then raise.
+        await websocket.close(code=1011)
+        return
     requests = 0
+    replay_requests = 0
     try:
         # A notice written from another task can find the client gone; the
         # socket is then disconnected, and reading from it would raise.
@@ -205,6 +305,7 @@ async def events_ws(websocket: WebSocket) -> None:
                 continue
             wanted = message.get("subscribe")
             unwanted = message.get("unsubscribe")
+            replay_after = message.get("replay_after")
             if isinstance(wanted, str):
                 requests += 1
                 if requests > _MAX_SUBSCRIPTION_REQUESTS:
@@ -221,11 +322,32 @@ async def events_ws(websocket: WebSocket) -> None:
             if isinstance(unwanted, str) and unwanted in channels:
                 channels.discard(unwanted)
                 await bus.unsubscribe(unwanted, sink)
+            if _is_cursor(replay_after):
+                replay_requests += 1
+                if replay_requests > _MAX_REPLAY_REQUESTS:
+                    await websocket.close(code=1008)
+                    return
+                response = await asyncio.to_thread(
+                    _replay_response, user, frozenset(channels), replay_after
+                )
+                if response is None:
+                    await websocket.close(code=1008)
+                    return
+                for channel in response.revoked:
+                    channels.discard(channel)
+                    await bus.unsubscribe(channel, sink)
+                await sink(response.frame)
     except (WebSocketDisconnect, ValueError):
         pass
     finally:
         for channel in channels:
             await bus.unsubscribe(channel, sink)
+
+
+def _is_cursor(value: object) -> TypeGuard[int]:
+    # ``bool`` is an ``int`` subclass and is never a cursor. Zero is the
+    # "before the first event" cursor that a fresh log starts from.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _subscription_allowed(user: User, channel: str) -> bool:

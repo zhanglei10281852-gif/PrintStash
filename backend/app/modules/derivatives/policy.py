@@ -21,6 +21,7 @@ class SettingName(StrEnum):
 
 SETTINGS = {
     JobKind.DERIVATIVES_MESH: SettingName.MESH,
+    JobKind.DERIVATIVES_VIEWER_STL: SettingName.MESH,
     JobKind.DERIVATIVES_GCODE: SettingName.GCODE,
     JobKind.DERIVATIVES_TOOLPATH: SettingName.TOOLPATH,
 }
@@ -69,6 +70,19 @@ def lock(session: Session) -> SystemConfig:
     return config
 
 
+def lock_generation(session: Session) -> SystemConfig:
+    """Share generation authority among publishers; regeneration takes it exclusively."""
+    begin_write(session, immediate=True)
+    config = session.exec(
+        select(SystemConfig).where(SystemConfig.id == 1).with_for_update(read=True)
+    ).first()
+    if config is None:
+        # Bootstrap normally creates it. The exceptional first writer must
+        # actually establish authority, never publish without a locked row.
+        return lock(session)
+    return config
+
+
 def admission(session: Session, definition: JobKind) -> SkipReason | None:
     return (
         None
@@ -93,11 +107,11 @@ def update(session: Session, changes: dict[SettingName, bool | None]) -> None:
         setattr(config, name, value)
     config.updated_at = utcnow()
     session.add(config)
-    session.commit()
-    from app.modules.work.events import derivative_policy_changed
+    from app.modules.work import event_log
     from app.modules.work.submission import nudge
 
-    derivative_policy_changed()
+    event_log.record_policy(session)
+    session.commit()
     for definition, name in SETTINGS.items():
         if name in changes:
             nudge(definition)

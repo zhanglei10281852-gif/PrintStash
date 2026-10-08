@@ -248,6 +248,13 @@ def _truncate_all(engine: Engine = _test_engine) -> None:
                     conn.exec_driver_sql(f"DROP TABLE {name}")
             for table in _all_table_names():
                 conn.exec_driver_sql(f"DELETE FROM {table}")
+            # Match the PostgreSQL harness's TRUNCATE ... RESTART IDENTITY:
+            # an AUTOINCREMENT table's high-water mark starts empty again.
+            if conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='sqlite_sequence'"
+            ).scalar():
+                conn.exec_driver_sql("DELETE FROM sqlite_sequence")
         finally:
             conn.exec_driver_sql("PRAGMA foreign_keys=ON")
     # Re-create sentinel rows.
@@ -343,7 +350,9 @@ def _rate_limiters_in(target: object) -> Iterator[object]:
 
 
 @pytest.fixture(autouse=True)
-def _patch_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
     """Override the session factory ContextVar to use the in-memory test engine.
 
     Single override point — replaces the previous double-monkeypatch of
@@ -370,6 +379,21 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     bind_backend(LocalStorageBackend())
+    from app.runtime.native_admission import LocalResourcePool
+    from app.runtime.native_runtime import bind_pool
+
+    bind_pool(LocalResourcePool(tmp_path_factory.mktemp("native-admission")))
+    from app.runtime.inference_resources import bind_pool as bind_inference_pool
+
+    bind_inference_pool(LocalResourcePool(tmp_path_factory.mktemp("inference-models")))
+    from app.runtime.preparation_runtime import bind_pools, make_pools
+
+    bind_pools(
+        make_pools(
+            tmp_path_factory.mktemp("source-preparation"),
+            tmp_path_factory.mktemp("source-io"),
+        )
+    )
     # Drop the process-wide httpx client so a test that drives async egress in
     # its own asyncio.run() loop doesn't inherit one bound to a prior (closed)
     # loop — the cache only rebinds on is_closed, which a closed loop doesn't
@@ -377,6 +401,14 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.core.http_client as _http_client_mod
 
     _http_client_mod.reset_for_tests()
+
+    # Provider clients and host semaphores are process-wide too. A test owns
+    # fresh caches; it must not close a previous test's client after that
+    # client's event loop has ended. Production shutdown stays unchanged.
+    from app.modules.ingestion import capture_provider_transport
+
+    monkeypatch.setattr(capture_provider_transport, "_pooled_clients", {})
+    monkeypatch.setattr(capture_provider_transport, "_host_limiters", {})
 
     from app.runtime import maintenance
 
